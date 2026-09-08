@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+.cache/
+__pycache__/
+*.pyc
+current_cookies.txt
+current_ua.txt
+.agents/
