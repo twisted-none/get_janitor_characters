@@ -94,10 +94,13 @@ async def handle_start(message: types.Message, analytics_store: AnalyticsStore) 
     if message.from_user:
         await _record_user(analytics_store, message.from_user, started=True)
     await message.answer(
-        "Привет! Я помогу сохранить персонажа из JannyAI или JanitorAI.\n\n"
-        "Пришли ссылку на страницу персонажа, и я отправлю его карточку в PNG.\n"
-        "Если что-то пошло не так, напиши в поддержку через /help.\n\n"
+        "✨ <b>Привет! Я помогу сохранить персонажа из JanitorAI.</b>\n\n"
+        "🔗 Пришли ссылку на страницу персонажа в JanitorAI.\n"
+        "🖼 Я скачаю его карточку и отправлю её в формате PNG.\n"
+        "📦 В картинку встроены все метаданные персонажа.\n\n"
+        "🆘 Если что-то пошло не так, напиши в поддержку через /help.\n\n"
         "Пришли ссылку, и начнем.",
+        parse_mode="HTML",
         reply_markup=_main_keyboard(message.from_user.id if message.from_user else 0),
     )
 
