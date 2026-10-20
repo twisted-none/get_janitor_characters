@@ -76,7 +76,9 @@ alert_bot = Bot(token=ALERT_BOT_TOKEN) if ALERT_BOT_TOKEN else None
 dp = Dispatcher()
 CHARACTER_URL_RE = (r"(?i)^\s*https?://(?:www\.)?(?P<source>janitorai|jannyai)\.com/"
                     r"(?:[a-z]{2,3}(?:-[a-z0-9]{2,8}){0,3}/)?characters/"
-                    r"(?P<id>[a-zA-Z0-9_-]{1,200})(?:/[^\s?#]*)?(?:\?[^\s#]*)?(?:#[^\s]*)?\s*$")
+                    r"(?P<id>[a-zA-Z0-9-]{1,200})"
+                    r"(?:_(?:[^\s%/?#\\\x00-\x1f\x7f]|%[0-9a-f]{2}){1,1800})?"
+                    r"(?:/[^\s?#]*)?(?:\?[^\s#]*)?(?:#[^\s]*)?\s*$")
 support_waiting: set[tuple[int, int]] = set()
 reply_waiting: dict[tuple[int, int], int] = {}
 broadcast_waiting: set[tuple[int, int]] = set()

@@ -90,7 +90,19 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.scope["handle_link"](self.message, None)
         download = self.scope["parser"].download_card
         download.assert_awaited_once()
-        self.assertEqual(download.await_args.args, ("abc_character-eri",))
+        self.assertEqual(download.await_args.args, ("abc",))
+        self.assertEqual(download.await_args.kwargs["source"], "janitorai")
+        self.message.answer_document.assert_awaited_once()
+
+    async def test_encoded_character_slug_downloads_using_only_uuid(self) -> None:
+        self.configure_download(DownloadSource.DATACAT)
+        identifier = "6460e31a-aa31-418f-8571-841afe8921e9"
+        self.message.text = (f"https://janitorai.com/characters/{identifier}"
+                             "_character-frederick-%E1%81%84%E1%81%83-twisted-disney")
+        await self.scope["handle_link"](self.message, None)
+        download = self.scope["parser"].download_card
+        download.assert_awaited_once()
+        self.assertEqual(download.await_args.args, (identifier,))
         self.assertEqual(download.await_args.kwargs["source"], "janitorai")
         self.message.answer_document.assert_awaited_once()
 
