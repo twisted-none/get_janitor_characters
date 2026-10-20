@@ -1,0 +1,65 @@
+# Security Fixes
+
+Проверка и исправления по аудиту от 14.10.2026. Область согласована пользователем: пункты 3-14. Политика доступа к /metrics и локальные Windows ACL файлов с секретами исключены из изменений. Значения .env не читались и не переносились в отчёт.
+
+## Changes
+
+| Пункт | Исправление | Проверка |
+| --- | --- | --- |
+| 3. Зависимости | Python 3.14.8, совместимые версии, полный SHA256 lock | Сборка, pip check, pip-audit |
+| 4. SSRF | HTTPS, список доменов, проверка всех DNS-адресов, подключение к проверенному IP с TLS SNI, повторная проверка редиректов | tests/test_safe_http.py |
+| 5. Очередь | До 1000 ожидающих задач, квант по пять запусков на пользователя, отмена и таймаут ожидания | tests/test_download_queue.py |
+| 6. Общая сессия | Приватные карточки и неизвестная видимость запрещены; скрытое определение публичной карточки разрешено | tests/test_security_policy.py, tests/test_janitor_proxy.py |
+| 7. Origin | Точный домен проверяется до ввода пароля и использования токена | tests/test_security_policy.py |
+| 8. Лимиты | Потоковое чтение с ограничением размера, лимиты страницы и изображений, WebSocket и service worker заблокированы | tests/test_safe_http.py, tests/test_parser.py |
+| 9. Секреты | Экспорт по списку разрешённых полей; журналы источников без сырых ответов и токенов; окружение worker без BOT_TOKEN/DATABASE_URL | tests/test_security_policy.py, tests/test_download_worker.py |
+| 10. Метрики | Запросы БД и форматирование вне event loop, общий кеш 30 секунд, таймауты БД | tests/test_metrics.py |
+| 11. Таймаут | Отдельный процесс на источник, принудительное завершение дерева, очистка временных файлов | tests/test_download_worker.py |
+| 12. Контейнер | Непривилегированный UID, read-only root, ограничение памяти/PID, сброс capabilities, no-new-privileges, Chromium sandbox | Локальный браузерный тест, см. ограничения ниже |
+| 13. Диалоги | Состояние привязано к паре chat/user; админские команды только в личке; одноразовое подтверждение конкретной рассылки | tests/test_access_controls.py, tests/test_dialog.py |
+| 14. Образ | Явный COPY исходников; исключены env, сессии, ключи, зависимости и граф | .dockerignore, Dockerfile |
+
+SQL-запросы параметризованы. Telegram ID для авторизации берётся из обновления Telegram, а не текста сообщения. Отдельного интерфейса входа пользователей с перебираемым паролем нет. Пользовательский HTML в метриках экранируется; политика доступа к метрикам не менялась по просьбе пользователя. Эти изменения не вводят RLS в PostgreSQL: граница доступа остаётся на уровне приложения и учётной записи БД.
+
+## Runtime
+
+Python 3.15 не выбран: текущий aiogram 3.31.0 требует Python <3.15. Целевой интерпретатор проекта и Docker: 3.14.8. Системный Python Windows не заменяется.
+
+requirements.txt содержит прямые версии; requirements.lock фиксирует все зависимости и хеши колёс. Для установки:
+
+```powershell
+python -m pip install --only-binary=:all: --require-hashes -r requirements.lock
+python -m pip check
+python -m unittest discover -s tests -v
+```
+
+Для пересоздания lock в чистом окружении CPython 3.14:
+
+```powershell
+python -m pip install --dry-run --ignore-installed --only-binary=:all: --report resolve.json -r requirements.txt
+python tools/resolve_lock.py resolve.json requirements.lock
+```
+
+После пересоздания нужны повторная сборка, тесты и pip-audit по lock. Docker Compose использует именованный том только для кеша/сессии, а не bind mount всего проекта. DATABASE_URL обязателен; встроенных запасных учётных данных нет. Существующую локальную сессию новый том автоматически не импортирует.
+
+Профиль docker/seccomp-browser.json основан на официальном профиле Playwright. Дополнительно разрешён syscall chroot, необходимый sandbox внутри непривилегированного user namespace; capability SYS_CHROOT контейнеру не выдаётся. Профиль не равнозначен seccomp=unconfined. XDG_CONFIG_HOME указывает в /tmp, чтобы Chromium не писал в read-only home.
+
+## Verification And Limits
+
+После локальной подготовки: 99 тестов на Python 3.14.8 прошли. Образ janitor-bot:local-check собран; pip check не обнаружил конфликтов. Используется Playwright 1.63.0 с соответствующим Chromium 153.0.8010.12; CloakBrowser удалён. Импорт main проверяется на фиктивных реквизитах без сети, UID 10001; файлов .env в образе нет. Исправлен нестабильный тест процентов: используются управляемые часы вместо прибавления к произвольному float monotonic.
+
+pip-audit после замены браузера: 25 закреплённых пакетов, известных уязвимостей не найдено на момент проверки. Это не аудит ОС и не полная проверка бинарника Chromium. Прежнее зависание CloakBrowser устранено заменой на официальный Chromium. В контейнере без сети успешно проверены chrome://sandbox и отрисовка страницы с sandbox, read-only root, UID 10001 и сброшенными capabilities. Инструменты и инструкции локальной подготовки находятся в PREDEPLOY.md; рабочий бот не развёртывался.
+
+Ранее живое чтение публичной карточки DataCat через новый worker было успешным: PNG 934589 байт, определение найдено. После замены браузера реальные Chromium-сценарии Janny API, fallback к странице, Janitor proxy и запрет приватной карточки проверены на синтетических ответах при полностью отключённой сети. Живой Janitor и реальная авторизация не вызывались. LLM-провайдер не подключён. Действующие правила сайтов требуют отдельной живой проверки в разрешённом окружении. Транспортный CLOAKBROWSER_PROXY отклоняется, чтобы не обещать маршрутизацию, которой нет у закреплённого HTTPS-клиента; Janitor proxy как источник определения не является этим транспортным прокси.
+
+На временной локальной PostgreSQL проверены аналитика, /health, /metrics, создание custom-format дампа, SHA256 и восстановление данных в отдельную пустую БД. Рабочая база и её резервные копии не использовались. Preflight проверен на фиктивных настройках, не загружает .env и не выводит значения.
+
+Рабочий бот не перезапускался и не развёртывался из тестового образа. Изменения политики /metrics и ACL не выполнялись.
+
+## Sources
+
+- Python: https://www.python.org/downloads/release/python-3148/
+- aiogram metadata: https://pypi.org/pypi/aiogram/3.31.0/json
+- Playwright Docker sandbox: https://playwright.dev/python/docs/docker
+- Playwright browser versions and installation: https://playwright.dev/python/docs/browsers
+- Seccomp upstream: https://github.com/microsoft/playwright/blob/main/utils/docker/seccomp_profile.json

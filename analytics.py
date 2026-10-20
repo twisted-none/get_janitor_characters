@@ -188,7 +188,8 @@ class AnalyticsStore:
             )
 
     def _connect(self) -> psycopg.Connection:
-        return psycopg.connect(self.database_url, autocommit=True, row_factory=dict_row)
+        return psycopg.connect(self.database_url, autocommit=True, row_factory=dict_row,
+                               connect_timeout=10, options="-c statement_timeout=15000 -c lock_timeout=5000")
 
 
 def render_prometheus(snapshot: AnalyticsSnapshot) -> str:

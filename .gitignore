@@ -7,3 +7,4 @@ __pycache__/
 current_cookies.txt
 current_ua.txt
 .agents/
+graphify-out/

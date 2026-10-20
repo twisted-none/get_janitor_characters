@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from time import monotonic
 
 from aiohttp import web
 
@@ -32,7 +33,14 @@ async def run_metrics_server(store: AnalyticsStore, host: str, port: int) -> Non
 
 async def _metrics(request: web.Request) -> web.Response:
     store: AnalyticsStore = request.app["analytics_store"]
-    payload = await asyncio.to_thread(render_prometheus, store.snapshot())
+    async with request.app.setdefault("snapshot_lock", asyncio.Lock()):
+        cached = request.app.get("snapshot_cache")
+        if cached is None or monotonic() - cached[0] >= 30:
+            snapshot = await asyncio.to_thread(store.snapshot)
+            payload = await asyncio.to_thread(render_prometheus, snapshot)
+            request.app["snapshot_cache"] = (monotonic(), payload)
+        else:
+            payload = cached[1]
     return web.Response(text=payload, content_type="text/plain; version=0.0.4")
 
 

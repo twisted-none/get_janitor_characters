@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from io import BytesIO
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from PIL import Image
 
@@ -56,6 +56,7 @@ class _FakeContext:
 
 
 class _FakePage:
+    url = "https://jannyai.com/characters/abc"
     def on(self, event: str, callback: object) -> None:
         pass
 
@@ -79,7 +80,7 @@ class _FakePage:
 
 
 class _FakeBrowser:
-    def new_context(self) -> _FakeContext:
+    def new_context(self, **kwargs) -> _FakeContext:
         return _FakeContext()
 
     def close(self) -> None:
@@ -99,6 +100,19 @@ class ParserTests(unittest.TestCase):
         decoded = json.loads(base64.b64decode(encoded).decode("utf-8"))
         self.assertEqual(decoded, card)
 
+    def test_verified_hidden_definition_marker_is_read_from_png(self) -> None:
+        card = {
+            "spec": "chara_card_v2",
+            "data": {"extensions": {"janitorai": {"definition_source": "janitor_proxy_prompt"}}},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "card.png")
+            parser._write_chara_png(_sample_png(), card, path)
+            self.assertTrue(parser.has_verified_hidden_definition(path))
+            card["data"]["extensions"]["janitorai"].pop("definition_source")
+            parser._write_chara_png(_sample_png(), card, path)
+            self.assertFalse(parser.has_verified_hidden_definition(path))
+
     def test_to_chara_card_v2_maps_required_janitor_fields(self) -> None:
         raw = {
             "name": "Ada",
@@ -114,7 +128,22 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(card["data"]["name"], "Ada")
         self.assertEqual(card["data"]["description"], "Analytical assistant")
         self.assertEqual(card["data"]["first_mes"], "Hello.")
-        self.assertEqual(card["data"]["extensions"]["janitorai"], raw)
+        self.assertEqual(card["data"]["extensions"]["janitorai"]["name"], raw["name"])
+        self.assertNotIn("avatarUrl", card["data"]["extensions"]["janitorai"])
+
+    def test_to_chara_card_v2_keeps_hidden_definition(self) -> None:
+        raw = {
+            "name": "Ada",
+            "description": "Public profile text",
+            "personality": "Hidden model definition",
+            "firstMessage": "Hello.",
+        }
+
+        card = parser._to_chara_card_v2(raw)
+
+        self.assertEqual(card["data"]["description"], "Public profile text")
+        self.assertEqual(card["data"]["personality"], "Hidden model definition")
+        self.assertEqual(card["data"]["creator_notes"], "Public profile text")
 
     def test_datacat_character_maps_to_card_and_avatar(self) -> None:
         character = {
@@ -141,10 +170,38 @@ class ParserTests(unittest.TestCase):
         card = parser._datacat_card_from_character(character)
 
         self.assertEqual(card["data"]["name"], "Ada")
-        self.assertEqual(card["data"]["description"], "Recovered definition")
+        self.assertEqual(card["data"]["description"], "Public notes")
+        self.assertEqual(card["data"]["personality"], "Recovered definition")
         self.assertEqual(card["data"]["creator_notes"], "Public notes")
         self.assertEqual(card["data"]["extensions"]["datacat"]["id"], "abc")
         self.assertEqual(parser._datacat_image_url(character, card), "https://cdn.example.test/ada.webp")
+
+    def test_datacat_card_does_not_label_personality_as_hidden_definition(self) -> None:
+        character = {
+            "character_id": "abc",
+            "creator_id": "creator-1",
+            "creator_name": "AdaCreator",
+            "primary_content_source_kind": "janitor",
+            "personality": "Hidden model definition",
+            "description": "Public profile text",
+            "chara_card_v2_json": {
+                "spec": "chara_card_v2",
+                "spec_version": "2.0",
+                "data": {
+                    "name": "Ada",
+                    "description": "Public profile text",
+                    "first_mes": "Hello.",
+                    "extensions": {},
+                },
+            },
+        }
+
+        card = parser._datacat_card_from_character(character)
+
+        self.assertEqual(card["data"]["description"], "Public profile text")
+        self.assertEqual(card["data"]["personality"], "Hidden model definition")
+        self.assertEqual(card["data"]["creator_notes"], "Public profile text")
+        self.assertNotIn("hidden_definition", card["data"]["extensions"]["datacat"])
 
     def test_datacat_character_falls_back_to_raw_fields(self) -> None:
         character = {
@@ -159,7 +216,8 @@ class ParserTests(unittest.TestCase):
         card = parser._datacat_card_from_character(character)
 
         self.assertEqual(card["data"]["name"], "Ada")
-        self.assertEqual(card["data"]["description"], "Analytical assistant")
+        self.assertEqual(card["data"]["description"], "Creator notes")
+        self.assertEqual(card["data"]["personality"], "Analytical assistant")
         self.assertEqual(card["data"]["creator_notes"], "Creator notes")
         self.assertEqual(
             parser._datacat_image_url(character, card),
@@ -214,29 +272,11 @@ class ParserTests(unittest.TestCase):
             parser._extract_character_from_state(state, payloads, "Janitor AI")
 
     def test_download_character_routes_by_source(self) -> None:
-        with (
-            patch.object(parser, "_download_datacat_character_sync", return_value="datacat.png") as datacat,
-            patch.object(parser, "_download_janny_character_sync") as janny,
-            patch.object(parser, "_download_janitor_character_sync") as janitor,
-        ):
-            self.assertEqual(asyncio.run(parser.download_character("abc", source="janitorai")), "datacat.png")
-            datacat.assert_called_once_with("abc")
-            janny.assert_not_called()
-            janitor.assert_not_called()
-
-        with (
-            patch.object(parser, "_download_datacat_character_sync", side_effect=ValueError("not found")) as datacat,
-            patch.object(parser, "_download_janny_character_sync", side_effect=ValueError("waf")) as janny,
-            patch.object(parser, "_download_janitor_character_sync", return_value="janitor.png") as janitor,
-        ):
-            self.assertEqual(asyncio.run(parser.download_character("abc", source="janitorai")), "janitor.png")
-            datacat.assert_called_once_with("abc")
-            janny.assert_called_once_with("abc")
-            janitor.assert_called_once_with("abc")
-
-        with patch.object(parser, "_download_janny_character_sync", return_value="janny.png") as janny:
-            self.assertEqual(asyncio.run(parser.download_character("abc", source="jannyai")), "janny.png")
-            janny.assert_called_once_with("abc")
+        for source in ("janitorai", "jannyai"):
+            result = Mock(file_path="card.png")
+            with patch.object(parser, "download_card", new_callable=AsyncMock, return_value=result) as download:
+                self.assertEqual(asyncio.run(parser.download_character("abc", source=source)), "card.png")
+            download.assert_awaited_once_with("abc", source)
 
     def test_janny_api_403_falls_back_to_browser_page_state(self) -> None:
         payload = {
@@ -252,7 +292,10 @@ class ParserTests(unittest.TestCase):
         with (
             patch.object(parser, "_launch", return_value=_FakeBrowser()),
             patch.object(parser, "_login_janny"),
-            patch("parser.socket.getaddrinfo", return_value=public),
+            patch.object(parser, "protect_context", side_effect=lambda context: context),
+            patch.object(parser, "_post_download_api", return_value=(403, "blocked")),
+            patch.object(parser, "_download_url_image_body", return_value=_sample_png()),
+            patch("safe_http.socket.getaddrinfo", return_value=public),
             patch.object(parser, "_extract_character_from_state", return_value=payload["character"]),
         ):
             path = parser._download_janny_character_sync("abc_character-harry-potter")
@@ -315,14 +358,14 @@ class ParserTests(unittest.TestCase):
     def test_validate_image_url_allows_https_and_blocks_private_ip(self) -> None:
         public = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
         private = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
-        with patch("parser.socket.getaddrinfo", return_value=public):
+        with patch("safe_http.socket.getaddrinfo", return_value=public):
             self.assertEqual(
                 parser._validate_image_url("/ada.png", "https://janitorai.com/character/ada"),
                 "https://janitorai.com/ada.png",
             )
-        with patch("parser.socket.getaddrinfo", return_value=private):
-            with self.assertRaisesRegex(ValueError, "небезопасный"):
-                parser._validate_image_url("https://localhost/ada.png", "https://janitorai.com")
+        with patch("safe_http.socket.getaddrinfo", return_value=private):
+            with self.assertRaisesRegex(ValueError, "Внутренние"):
+                parser._validate_image_url("https://janitorai.com/ada.png", "https://janitorai.com")
 
     def test_login_janitor_requires_complete_credentials(self) -> None:
         with patch.dict(os.environ, {"JANITORAI_EMAIL": "user@example.test", "JANITORAI_PASSWORD": ""}):
@@ -340,6 +383,28 @@ class ParserTests(unittest.TestCase):
             json.dumps({"exp": int(time.time()) - 60}).encode()
         ).decode().rstrip("=")
         self.assertFalse(parser._cookie_is_usable("sb-access-token", f"x.{payload}.x"))
+
+    def test_saved_janitor_state_excludes_other_sites(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        state = {
+            "cookies": [
+                {"name": "auth", "domain": ".janitorai.com"},
+                {"name": "other", "domain": "eviljanitorai.com"},
+            ],
+            "origins": [
+                {"origin": "https://janitorai.com", "localStorage": []},
+                {"origin": "https://other.example", "localStorage": []},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.json"
+            with patch.dict(os.environ, {"JANITOR_STORAGE_STATE_PATH": str(path)}):
+                parser._save_janitor_state(Mock(storage_state=lambda: state))
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual([cookie["name"] for cookie in saved["cookies"]], ["auth"])
+        self.assertEqual([origin["origin"] for origin in saved["origins"]], ["https://janitorai.com"])
 
 
 if __name__ == "__main__":

@@ -1,13 +1,13 @@
 services:
   bot:
     build: .
-    container_name: janny_ai_bot
+    container_name: janitor_characters_bot
     env_file:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
-      - CLOAKBROWSER_CACHE_DIR=/app/.cache/cloakbrowser
-      - CLOAKBROWSER_AUTO_UPDATE=false
+      - PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+      - XDG_CONFIG_HOME=/tmp/browser-config
       - DOWNLOAD_TIMEOUT_SECONDS=${DOWNLOAD_TIMEOUT_SECONDS:-3600}
       - DOWNLOAD_CONCURRENCY=${DOWNLOAD_CONCURRENCY:-1}
       - DATABASE_URL=${DATABASE_URL}
@@ -16,5 +16,17 @@ services:
     ports:
       - "${METRICS_HOST_PORT:-18001}:${METRICS_PORT:-8000}"
     restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./docker/seccomp-browser.json
+    shm_size: 256mb
+    mem_limit: 1536m
+    pids_limit: 256
+    tmpfs:
+      - /tmp:rw,nosuid,size=256m,mode=1777
     volumes:
-      - .:/app
+      - /srv/projects/data/get_janitor_characters_bot/cache:/app/.cache
