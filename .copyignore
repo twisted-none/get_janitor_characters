@@ -1,27 +1,27 @@
 # Git and local development tools
-/.git/
-/.agents/
-/.gitignore
-/.graphifyignore
-/.python-version
+.git/
+.agents/
+.gitignore
+.graphifyignore
+.python-version
 
 # Caches, local environments and project graph
-/.cache/
-/graphify-out/
+.cache/
+graphify-out/
 **/__pycache__/
 
 # Tests and local development utilities
-/tests/
-/docker/Dockerfile.local-check
-/tools/resolve_lock.py
-/janitor_login.py
-/tampermonkey_janitor_export.user.js
+tests/
+docker/Dockerfile.local-check
+tools/resolve_lock.py
+janitor_login.py
+tampermonkey_janitor_export.user.js
 
 # Local cookies and example configuration
-/current_cookies.txt
-/.env.example
+current_cookies.txt
+.env.example
 
 # Documentation not required at runtime
-/DOWNLOAD_FLOW.md
-/PREDEPLOY.md
-/SECURITY_FIXES.md
+DOWNLOAD_FLOW.md
+PREDEPLOY.md
+SECURITY_FIXES.md
