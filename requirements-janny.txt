@@ -1,0 +1,4 @@
+# Separate interpreter: Camoufox 0.5.8 requires Playwright <1.63.
+camoufox==0.5.8
+playwright==1.62.0
+python-xlib==0.33

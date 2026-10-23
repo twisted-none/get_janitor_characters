@@ -8,11 +8,13 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock
 
+from download_flow import DownloadFailed
+
 
 class AccessControlTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         tree = ast.parse(Path(__file__).resolve().parents[1].joinpath("main.py").read_text(encoding="utf-8"))
-        names = {"_is_admin", "_clear_dialog", "handle_admin_command", "handle_broadcast", "handle_broadcast_confirm", "handle_admin_reply", "_allow_notification"}
+        names = {"_is_admin", "_clear_dialog", "handle_admin_command", "handle_broadcast", "handle_broadcast_confirm", "handle_admin_reply", "_allow_notification", "_notify_admin"}
         nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
         for node in nodes:
             node.decorator_list = []
@@ -22,11 +24,21 @@ class AccessControlTests(unittest.IsolatedAsyncioTestCase):
                       "_main_keyboard": lambda user: None, "InlineKeyboardMarkup": lambda **kw: kw,
                       "InlineKeyboardButton": lambda **kw: kw, "TelegramAPIError": RuntimeError,
                       "TelegramRetryAfter": type("Retry", (Exception,), {})}
+        self.scope.update(DownloadFailed=DownloadFailed, alert_bot=None)
         exec(compile("from __future__ import annotations\n" + ast.unparse(ast.Module(body=nodes, type_ignores=[])), "access-tests", "exec"), self.scope)
 
     def message(self, user=7, chat=1, text="/broadcast", kind="private"):
         return SimpleNamespace(from_user=SimpleNamespace(id=user), chat=SimpleNamespace(id=chat, type=kind),
                                text=text, answer=AsyncMock(), bot=SimpleNamespace(send_message=AsyncMock()))
+
+    async def test_admin_notification_contains_safe_source_diagnostics(self):
+        message = self.message()
+        message.from_user.username = "fixture"
+        error = DownloadFailed({"datacat": {"code": "http_error", "http_status": 410, "message": "fixture-secret"}})
+        await self.scope["_notify_admin"](message, "https://example.invalid/fixture", error)
+        text = message.bot.send_message.await_args.args[1]
+        self.assertIn("datacat: http_error (HTTP 410)", text)
+        self.assertNotIn("fixture-secret", text)
 
     async def test_non_admin_and_group_cannot_start_broadcast(self):
         for message in (self.message(user=8), self.message(kind="group")):

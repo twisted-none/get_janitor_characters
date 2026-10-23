@@ -4,30 +4,31 @@ import logging
 from urllib.parse import urlsplit
 
 from safe_http import SITE_DOMAINS, fetch
+from download_errors import SourceError, describe_error
 
 
 def require_origin(page, expected="https://janitorai.com"):
     actual = urlsplit(str(page.url))
     wanted = urlsplit(expected)
     if (actual.scheme, actual.hostname, actual.port) != (wanted.scheme, wanted.hostname, wanted.port):
-        raise ValueError("Страница перенаправлена на недопустимый домен.")
+        raise SourceError("unsafe_url", "Страница перенаправлена на недопустимый домен.")
 
 
 def require_public(character):
     for key in ("is_private", "isPrivate", "private"):
         if character.get(key) is True:
-            raise ValueError("Приватные карточки через общую сессию недоступны.")
+            raise SourceError("private_card", "Приватные карточки через общую сессию недоступны.")
     for key in ("is_public", "isPublic", "public"):
         if character.get(key) is False:
-            raise ValueError("Приватные карточки через общую сессию недоступны.")
+            raise SourceError("private_card", "Приватные карточки через общую сессию недоступны.")
     visibility = str(character.get("visibility", "")).lower()
     if visibility and visibility != "public":
-        raise ValueError("Приватные карточки через общую сессию недоступны.")
+        raise SourceError("private_card", "Приватные карточки через общую сессию недоступны.")
     if visibility == "public" or any(character.get(key) is True for key in ("is_public", "isPublic", "public")):
         return
     if any(character.get(key) is False for key in ("is_private", "isPrivate", "private")):
         return
-    raise ValueError("Не удалось подтвердить публичность карточки.")
+    raise SourceError("visibility_unknown", "Не удалось подтвердить публичность карточки.")
 
 
 RAW_FIELDS = {
@@ -53,7 +54,7 @@ def clean_card(card):
         for source, fields in {
             "janitorai": RAW_FIELDS,
             "datacat": {"id", "sourceKind", "creatorId", "creatorName", "definition_available"},
-            "download_bot": {"source", "definition_status"},
+            "download_bot": {"source", "definition_status", "lorebooks", "lorebooks_missing"},
         }.items():
             if isinstance(extensions.get(source), dict):
                 result["extensions"][source] = {key: value for key, value in extensions[source].items() if key in fields}
@@ -68,7 +69,7 @@ def protect_context(context):
         try:
             budget[0] += 1
             if budget[0] > 200:
-                raise ValueError("Слишком много запросов страницы.")
+                raise SourceError("response_too_large", "Слишком много запросов страницы.")
             request = route.request
             headers = request.all_headers()
             status, response_headers, body, _ = fetch(
@@ -79,12 +80,20 @@ def protect_context(context):
             )
             budget[1] += len(body)
             if budget[1] > 64_000_000:
-                raise ValueError("Страница слишком большая.")
+                raise SourceError("response_too_large", "Страница слишком большая.")
             response_headers = {key: value for key, value in response_headers.items()
                                 if key not in {"transfer-encoding", "connection", "content-length"}}
             route.fulfill(status=status, headers=response_headers, body=body)
         except Exception as exc:
             logging.debug("Browser request refused: %s", type(exc).__name__)
+            request = route.request
+            critical = request.is_navigation_request()
+            if not critical and request.resource_type in {"fetch", "xhr"}:
+                host = urlsplit(request.url).hostname or ""
+                critical = any(host == domain or host.endswith("." + domain)
+                               for domain in ("janitorai.com", "jannyai.com", "datacat.run"))
+            if critical:
+                context._download_failure = describe_error(exc)
             route.abort()
 
     context.route("**/*", route_request)

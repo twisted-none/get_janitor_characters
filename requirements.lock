@@ -1,4 +1,5 @@
 # Generated from a clean CPython 3.14 resolution. Do not edit manually.
+json5==0.17.3 --hash=sha256:2c8b22a893c35cd6a3c5ccbf1dd1c7d02c25dc1b5897fea658f9bf08c2e05f9a
 aiofiles==25.1.0 --hash=sha256:abe311e527c862958650f9438e859c1fa7568a141b22abcd015e120e86a85695
 aiogram==3.31.0 --hash=sha256:d889493c5917a867fc9da81fd6e6b3ae438e98bfe1b004fcdafe7400461a6c1b
 aiohappyeyeballs==2.7.1 --hash=sha256:9243213661e29250eb41368e5daa826fc017156c3b8a11440826b2e3ed376472

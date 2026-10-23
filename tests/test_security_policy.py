@@ -3,9 +3,22 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from security_policy import clean_card, protect_context, require_origin, require_public
+from download_errors import SourceError
 
 
 class SecurityPolicyTests(unittest.TestCase):
+    def test_request_abort_keeps_safe_cause_for_browser_stage(self):
+        context = Mock()
+        protect_context(context)
+        callback = context.route.call_args.args[1]
+        route = Mock()
+        route.request.is_navigation_request.return_value = True
+        with patch("security_policy.fetch", side_effect=SourceError("unsafe_url", "fixture-secret")):
+            callback(route)
+        self.assertEqual(context._download_failure.code, "unsafe_url")
+        self.assertNotIn("fixture-secret", str(context._download_failure.to_payload()))
+        route.abort.assert_called_once()
+
     def test_hidden_definition_does_not_make_public_card_private(self):
         require_public({"is_public": True, "showdefinition": False})
         for card in ({"is_public": False}, {}, {"is_public": True, "is_private": True}):

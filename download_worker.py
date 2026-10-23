@@ -8,15 +8,20 @@ import signal
 import subprocess
 import sys
 import tempfile
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from download_flow import Candidate
+from download_errors import SourceError, describe_error
+import download_trace as trace
 
 
 async def run_isolated(character_id: str, source: str, timeout: float = 300) -> Candidate:
     with tempfile.TemporaryDirectory(prefix="card-job-") as directory:
         root = Path(directory)
         result_path = root / "result.json"
+        events_path = root / "events.jsonl"
+        job = trace.current_job() or uuid4().hex
         allowed = {"PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "HOME", "USERPROFILE",
                    "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG", "LD_LIBRARY_PATH", "XDG_CACHE_HOME",
                    "XDG_CONFIG_HOME",
@@ -30,12 +35,30 @@ async def run_isolated(character_id: str, source: str, timeout: float = 300) -> 
         )
         try:
             await asyncio.wait_for(process.wait(), timeout)
-            if process.returncode != 0 or not result_path.is_file() or result_path.stat().st_size > 4096:
-                raise ValueError("Источник не вернул допустимую карточку.")
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-            card = Path(result["file_path"]).resolve(strict=True)
-            if card.parent != root.resolve() or card.suffix != ".png":
-                raise ValueError("Недопустимый файл результата.")
+            if not result_path.is_file():
+                raise SourceError("worker_failed", exit_code=process.returncode)
+            if result_path.stat().st_size > 4096:
+                raise SourceError("worker_invalid_result", exit_code=process.returncode)
+            try:
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+            except (ValueError, UnicodeError):
+                raise SourceError("worker_invalid_result", exit_code=process.returncode) from None
+            if not isinstance(result, dict):
+                raise SourceError("worker_invalid_result", exit_code=process.returncode)
+            if "error" in result:
+                failure = SourceError.from_payload(result["error"])
+                failure.exit_code = process.returncode
+                raise failure
+            if process.returncode != 0:
+                raise SourceError("worker_failed", exit_code=process.returncode)
+            if not isinstance(result.get("file_path"), str) or type(result.get("definition_available")) is not bool:
+                raise SourceError("worker_invalid_result")
+            try:
+                card = Path(result["file_path"]).resolve(strict=True)
+            except (OSError, ValueError):
+                raise SourceError("worker_invalid_result") from None
+            if card.parent != root.resolve() or card.suffix != ".png" or not card.is_file():
+                raise SourceError("worker_invalid_result")
             descriptor, destination = tempfile.mkstemp(prefix="character-", suffix=".png")
             os.close(descriptor)
             try:
@@ -59,28 +82,34 @@ async def run_isolated(character_id: str, source: str, timeout: float = 300) -> 
             if process.returncode is None:
                 process.kill()
             await process.wait()
+            trace.relay(events_path, job, source)
 
 
 def main():
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import parser
-    from download_flow import DownloadSource
-
     character_id, source, result_name = sys.argv[1:]
     result_path = Path(result_name)
     if result_path.resolve().parent != Path.cwd().resolve() or result_path.name != "result.json":
         raise ValueError("Invalid result path")
     if not character_id or len(character_id) > 200 or not all(char.isascii() and (char.isalnum() or char in "_-") for char in character_id):
         raise ValueError("Invalid character identifier")
-    downloaders = {"datacat": parser._download_datacat_character_sync,
-                   "jannyai": parser._download_janny_character_sync,
-                   "proxy": parser._download_janitor_character_sync}
-    parser._character_file_path = lambda: str(result_path.parent / "character.png")
-    candidate = parser._download_candidate_sync(downloaders[source], character_id, DownloadSource(source))
-    result_path.write_text(json.dumps({"file_path": candidate.file_path,
-                                       "definition_available": candidate.definition_available,
-                                       "notice": candidate.notice}), encoding="utf-8")
+    try:
+        import parser
+        from download_flow import DownloadSource
+
+        downloaders = {"datacat": parser._download_datacat_character_sync,
+                       "jannyai": parser._download_janny_character_sync,
+                       "proxy": parser._download_janitor_character_sync}
+        parser._character_file_path = lambda: str(result_path.parent / "character.png")
+        with trace.session(character_id, source, result_path.parent / "events.jsonl"):
+            candidate = parser._download_candidate_sync(downloaders[source], character_id, DownloadSource(source))
+        result = {"file_path": candidate.file_path, "definition_available": candidate.definition_available,
+                  "notice": candidate.notice}
+    except Exception as exc:
+        result_path.write_text(json.dumps({"error": describe_error(exc).to_payload()}), encoding="utf-8")
+        return 1
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 from download_flow import DownloadFailed, DownloadResult, DownloadSource, remove_download
 from download_status import DownloadStatus, active_status, queue_status
 from download_queue import DownloadQueue, QueueFull
+import download_trace as trace
 
 
 class FakeTelegramError(Exception):
@@ -37,7 +38,7 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
             answer=AsyncMock(side_effect=[self.queue_msg, self.wait_msg]), answer_document=AsyncMock(),
         )
         self.scope = {
-            "re": re, "asyncio": asyncio, "logging": logging, "os": os,
+            "re": re, "asyncio": asyncio, "logging": logging, "os": os, 'trace': trace,
             "CHARACTER_URL_RE": ast.literal_eval(assignment.value),
             "DownloadStatus": DownloadStatus, "active_status": active_status,
             "queue_status": queue_status, "remove_download": remove_download,
@@ -49,8 +50,16 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
             "TelegramAPIError": FakeTelegramError,
             "DownloadFailed": DownloadFailed,
         }
+        async def deliver_fixture(message, result, identifier, mode):
+            await message.answer_document(document=(result.file_path, identifier + '.png'), caption=result.caption)
+        self.scope['deliver'] = deliver_fixture
         code = "from __future__ import annotations\n" + ast.unparse(ast.Module(body=[handler], type_ignores=[]))
         exec(compile(code, "main.py", "exec"), self.scope)
+        original = self.scope['handle_link']
+        self.preferences = SimpleNamespace(get_lorebook_mode=lambda _: 'separate')
+        async def with_preferences(message, store):
+            await original(message, store or self.preferences)
+        self.scope['handle_link'] = with_preferences
 
     def configure_download(self, source: DownloadSource, complete: bool = True) -> None:
         async def download(_character_id: str, *, source: str, on_progress: DownloadStatus) -> DownloadResult:
@@ -65,7 +74,7 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_datacat_sends_no_caption_and_clears_status(self) -> None:
         self.configure_download(DownloadSource.DATACAT)
-        await self.scope["handle_link"](self.message, None)
+        await self.scope["handle_link"](self.message, SimpleNamespace(get_lorebook_mode=lambda _: 'separate'))
         self.assertIsNone(self.message.answer_document.await_args.kwargs["caption"])
         self.assertEqual(self.message.answer.await_count, 2)
         self.queue_msg.delete.assert_awaited_once()
@@ -119,7 +128,7 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.configure_download(DownloadSource.DATACAT)
         self.wait_msg.delete.side_effect = FakeTelegramError("already deleted")
         await self.scope["handle_link"](self.message, None)
-        self.scope["_finish_download"].assert_awaited_once_with(None, 1, success=True)
+        self.scope["_finish_download"].assert_awaited_once_with(self.preferences, 1, success=True)
         self.scope["_notify_admin"].assert_not_awaited()
 
     async def test_queue_message_is_replaced_when_slot_opens(self) -> None:
@@ -137,8 +146,9 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("скачивается", self.message.answer.await_args.args[0])
         self.wait_msg.delete.assert_awaited_once()
 
-    async def test_missing_llm_connection_is_visible_in_final_error(self) -> None:
-        self.scope["parser"] = SimpleNamespace(download_card=AsyncMock(side_effect=DownloadFailed(False)))
+    async def test_final_error_does_not_mention_llm(self) -> None:
+        self.scope["parser"] = SimpleNamespace(download_card=AsyncMock(side_effect=DownloadFailed()))
         await self.scope["handle_link"](self.message, None)
-        self.assertIn("LLM пока недоступно", self.wait_msg.edit_text.await_args.args[0])
+        self.assertIn("Не удалось получить карточку", self.wait_msg.edit_text.await_args.args[0])
+        self.assertNotIn("LLM", self.wait_msg.edit_text.await_args.args[0])
         self.message.answer_document.assert_not_awaited()

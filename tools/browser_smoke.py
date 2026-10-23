@@ -99,7 +99,7 @@ def main():
                     os.environ, {"JANITOR_STORAGE_STATE_PATH": ""}
                 ):
                     source = DownloadSource.JANNYAI if mode.startswith("janny") else DownloadSource.PROXY
-                    downloader = parser._download_janny_character_sync if mode.startswith("janny") else parser._download_janitor_character_sync
+                    downloader = parser._download_janny_api_sync if mode.startswith("janny") else parser._download_janitor_character_sync
                     if mode == "private":
                         try:
                             parser._download_candidate_sync(downloader, "fixture", source)

@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
 
-from download_flow import Candidate, DownloadSource, run_download_flow
+from download_flow import Candidate, DownloadFailed, DownloadSource, run_download_flow
+from download_errors import SourceError
 
 
 class DownloadFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -82,6 +83,22 @@ class DownloadFlowTests(unittest.IsolatedAsyncioTestCase):
         stages = {source: AsyncMock(side_effect=ValueError("unavailable")) for source in DownloadSource}
         with self.assertRaisesRegex(ValueError, "получить карточку"):
             await run_download_flow(stages, self.status)
+
+    async def test_source_diagnostics_have_no_secret_messages_or_llm_error(self) -> None:
+        stages = {
+            DownloadSource.DATACAT: AsyncMock(side_effect=SourceError("http_error", "fixture-secret", http_status=403)),
+            DownloadSource.JANNYAI: AsyncMock(side_effect=PermissionError("fixture-secret")),
+            DownloadSource.PROXY: AsyncMock(side_effect=TimeoutError("fixture-secret")),
+        }
+        with self.assertLogs(level="WARNING") as logs:
+            with self.assertRaises(DownloadFailed) as caught:
+                await run_download_flow(stages, self.status)
+        self.assertEqual(caught.exception.diagnostics["datacat"]["http_status"], 403)
+        self.assertEqual(caught.exception.diagnostics["jannyai"]["code"], "permission_denied")
+        self.assertNotIn("fixture-secret", repr(caught.exception.diagnostics))
+        self.assertNotIn("fixture-secret", "\n".join(logs.output))
+        self.assertNotIn("LLM", str(caught.exception))
+        self.assertIn("code=http_error", logs.output[0])
 
     async def test_cancel_does_not_start_later_sources_and_cleans_partial(self) -> None:
         first = self.candidate("partial", complete=False)

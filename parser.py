@@ -21,6 +21,9 @@ from PIL import Image, PngImagePlugin
 from janitor_proxy import extract_definition, get_access_token
 from download_flow import Candidate, DownloadResult, DownloadSource, ProgressCallback, remove_download, run_download_flow
 from safe_http import fetch, validate_url
+from download_errors import SourceError, describe_error
+import download_trace as trace
+import lorebooks
 from security_policy import RAW_FIELDS, clean_card, protect_context, require_origin, require_public
 
 GLOBAL_COOKIES: dict[str, str] = {}
@@ -161,11 +164,39 @@ def _sync_context_cookies(context: Any) -> None:
             GLOBAL_COOKIES[name] = value
 
 
+@trace.traced('browser_launch')
 def _launch(*, headless: bool = True) -> Any:
     if os.getenv("CLOAKBROWSER_PROXY"):
-        raise ValueError("Транспортный proxy не поддерживается защищённым HTTPS-клиентом.")
+        raise SourceError("configuration_error", "Транспортный proxy не поддерживается защищённым HTTPS-клиентом.")
     logging.info("Запускаем Chromium с sandbox")
     return launch_browser(headless=headless)
+
+
+def _context_failure(context, error):
+    failure = getattr(context, "_download_failure", None)
+    diagnostic = describe_error(error)
+    if not isinstance(error, SourceError) and isinstance(failure, SourceError):
+        diagnostic = failure
+    elif diagnostic.code == "internal_error" and type(error).__module__.startswith("playwright"):
+        diagnostic = SourceError("browser_request_failed", error_type=type(error).__name__)
+    status = getattr(context, "_download_api_status", None)
+    if diagnostic.http_status is None and type(status) is int and 400 <= status <= 599:
+        diagnostic.http_status = status
+    return diagnostic
+
+
+def _navigate(page, url, **options):
+    context = getattr(page, "context", None)
+    if context is not None:
+        context._download_failure = None
+    try:
+        with trace.operation('navigate', endpoint=trace.endpoint(url), timeout_ms=options.get('timeout', 30000)):
+            response = page.goto(url, **options)
+            if response:
+                trace.emit('response', operation='navigate', http_status=response.status)
+            return response
+    except Exception as exc:
+        raise _context_failure(context, exc) from None
 
 
 def _post_download_api(context: Any, api_url: str, page_url: str, character_id: str, user_agent: str) -> tuple[int, str]:
@@ -218,12 +249,26 @@ def _capture_json_response(response: Any, payloads: list[Any], hosts: tuple[str,
 
 
 def _download_janny_character_sync(character_id: str) -> str:
+    from janny_public import BROWSER_PYTHON, download_public_card
+
+    if BROWSER_PYTHON.is_file():
+        file_path = _character_file_path()
+        try:
+            return download_public_card(character_id, file_path)
+        except BaseException:
+            remove_download(file_path)
+            raise
+    return _download_janny_api_sync(character_id)
+
+
+def _download_janny_api_sync(character_id: str) -> str:
     logging.info("Старт скачивания character_id=%s", character_id)
     api_url = "https://api.jannyai.com/api/v1/download"
     page_url = f"https://jannyai.com/characters/{character_id}"
     uuid_part = character_id.split("_")[0]
     file_path = _character_file_path()
     browser = _launch()
+    context = None
     payloads: list[Any] = []
     logging.info("Chromium запущен")
 
@@ -233,7 +278,7 @@ def _download_janny_character_sync(character_id: str) -> str:
         _login_janny(page)
         page.on("response", lambda response: _capture_json_response(response, payloads, ("jannyai.com",)))
         logging.info("Открываем страницу через Chromium: %s", page_url)
-        page.goto(page_url, wait_until="domcontentloaded", timeout=30_000)
+        _navigate(page, page_url, wait_until="domcontentloaded", timeout=30_000)
         require_origin(page, "https://jannyai.com")
         user_agent = page.evaluate("navigator.userAgent")
         logging.info("Страница открыта, UA Chromium получен")
@@ -246,12 +291,13 @@ def _download_janny_character_sync(character_id: str) -> str:
             status, api_text = int(result["status"]), result["body"]
             logging.info("Download API через browser fetch ответил статусом %s", status)
         else:
-            logging.warning("Browser fetch не сработал: %s", result.get("message"))
+            logging.warning("Browser fetch не сработал; пробуем защищённый HTTPS-клиент")
             status, api_text = _post_download_api(context, api_url, page_url, uuid_part, user_agent)
 
         if status == 403:
             logging.warning("Browser/API ответил 403, повторяем с явным Cookie header")
             status, api_text = _post_download_api(context, api_url, page_url, uuid_part, user_agent)
+        context._download_api_status = status
         if status != 200:
             reason = f"Ошибка API: HTTP {status}"
             logging.warning("Janny download API недоступен, пробуем извлечь карточку со страницы: %s", reason)
@@ -273,6 +319,9 @@ def _download_janny_character_sync(character_id: str) -> str:
             f.write(image_body)
         logging.info("PNG сохранен: %s", file_path)
         return file_path
+    except Exception as exc:
+        remove_download(file_path)
+        raise _context_failure(context, exc) from None
     except BaseException:
         remove_download(file_path)
         raise
@@ -583,13 +632,14 @@ def _extract_character_from_state(state: dict[str, Any], payloads: list[Any], si
 
     body = f"{state.get('title', '')}\n{state.get('bodyText', '')}".lower()
     if any(marker in body for marker in ("sign in", "log in", "login", "private")):
-        raise ValueError(f"Персонаж недоступен: нужны актуальные cookies {site_name}.")
+        raise SourceError("auth_required", f"Персонаж недоступен: нужны актуальные cookies {site_name}.")
     if any(marker in body for marker in ("cloudflare", "verify you are human", "access denied", "challenge")):
-        raise ValueError(f"{site_name} вернул Cloudflare/WAF вместо карточки.")
+        raise SourceError("challenge_required", f"{site_name} вернул Cloudflare/WAF вместо карточки.")
     logging.warning("%s card data not found", site_name)
-    raise ValueError(f"Не удалось извлечь данные карточки {site_name}.")
+    raise SourceError("card_invalid", f"Не удалось извлечь данные карточки {site_name}.")
 
 
+@trace.traced('parse_card')
 def _to_chara_card_v2(raw: dict[str, Any]) -> dict[str, Any]:
     name = _as_text(_key_lookup(raw, ("name", "title", "characterName", "character_name", "displayName", "display_name")))
     public_description = _public_description_text(raw)
@@ -604,9 +654,9 @@ def _to_chara_card_v2(raw: dict[str, Any]) -> dict[str, Any]:
     )
     if not name or not description or not first_mes:
         logging.warning("Incomplete Janitor card fields: keys=%s", sorted(raw.keys()))
-        raise ValueError("Не удалось извлечь обязательные поля карточки Janitor AI.")
+        raise SourceError("card_invalid", "Не удалось извлечь обязательные поля карточки Janitor AI.")
 
-    return {
+    card = {
         "spec": "chara_card_v2",
         "spec_version": "2.0",
         "data": {
@@ -630,8 +680,12 @@ def _to_chara_card_v2(raw: dict[str, Any]) -> dict[str, Any]:
             "extensions": {"janitorai": {key: value for key, value in raw.items() if key in RAW_FIELDS}},
         },
     }
+    if isinstance(raw.get('character_book'), dict):
+        card['data']['character_book'] = raw['character_book']
+    return lorebooks.attach(raw, card)
 
 
+@trace.traced('write_png')
 def _write_chara_png(image_body: bytes, card: dict[str, Any], file_path: str) -> None:
     png_info = PngImagePlugin.PngInfo()
     payload = json.dumps(card, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -644,23 +698,30 @@ def _write_chara_png(image_body: bytes, card: dict[str, Any], file_path: str) ->
 
 def has_verified_hidden_definition(file_path: str) -> bool:
     try:
-        with Image.open(file_path) as image:
-            encoded = image.info.get("chara", "")
-        card = json.loads(base64.b64decode(encoded, validate=True))
+        card = _read_png_card_payload(file_path)
         raw = card["data"]["extensions"]["janitorai"]
         return isinstance(raw, dict) and raw.get("definition_source") == "janitor_proxy_prompt"
     except (OSError, ValueError, TypeError, KeyError, binascii.Error):
         return False
 
 
-def _read_card(file_path: str) -> dict[str, Any]:
+def _read_png_card_payload(file_path: str) -> dict[str, Any]:
     with Image.open(file_path, formats=("PNG",)) as image:
+        if image.width * image.height > Image.MAX_IMAGE_PIXELS:
+            raise SourceError('image_invalid')
+        # PNG text chunks may follow IDAT and are only available after loading.
+        image.load()
         encoded = image.info.get("chara", "")
     if not isinstance(encoded, str) or not encoded or len(encoded) > 12_000_000:
         raise ValueError("PNG не содержит допустимые данные карточки.")
     card = json.loads(base64.b64decode(encoded, validate=True))
     if not isinstance(card, dict):
         raise ValueError("Неверный формат карточки.")
+    return card
+
+
+def _read_card(file_path: str) -> dict[str, Any]:
+    card = _read_png_card_payload(file_path)
     data = card.get("data", card)
     if not isinstance(data, dict) or not _as_text(data.get("name")) or not _as_text(data.get("first_mes")):
         raise ValueError("Карточка не содержит обязательные поля.")
@@ -682,15 +743,23 @@ def _card_definition_available(data: dict[str, Any]) -> bool:
 
 
 def _mark_download(result: DownloadResult) -> None:
-    card = clean_card(_read_card(result.file_path))
+    card = _read_card(result.file_path)
+    original = card.get('data', card)
+    extensions = original.get('extensions', {})
+    metadata = extensions.get('download_bot', {}) if isinstance(extensions, dict) else {}
+    if not isinstance(metadata, dict) or not isinstance(metadata.get('lorebooks'), list):
+        raw = extensions.get('janitorai', {}) if isinstance(extensions, dict) else {}
+        raw = raw if isinstance(raw, dict) else {}
+        lorebooks.attach(dict(raw, scripts=original.get('scripts') or raw.get('scripts') or []), card)
+    card = clean_card(card)
     data = card.get("data", card)
     if not isinstance(data.get("extensions"), dict):
         data["extensions"] = {}
-    data["extensions"]["download_bot"] = {
+    data["extensions"].setdefault("download_bot", {}).update({
         "source": result.source.value,
         "definition_status": ("reconstructed" if result.reconstructed else
                               "available" if result.definition_available else "unavailable"),
-    }
+    })
     with open(result.file_path, "rb") as image_file:
         image_body = image_file.read(IMAGE_RESPONSE_LIMIT + 1)
     if len(image_body) > IMAGE_RESPONSE_LIMIT:
@@ -802,6 +871,7 @@ def _dismiss_janitor_locale_modal(page: Any) -> None:
         modal.first.locator("button").first.click(timeout=5_000)
 
 
+@trace.traced('login')
 def _login_site(page: Any, base_url: str, site_name: str, *, strict_form: bool) -> None:
     credential_prefix = "JANITORAI" if strict_form else "JANNYAI"
     email = os.getenv(f"{credential_prefix}_EMAIL", "").strip()
@@ -809,7 +879,7 @@ def _login_site(page: Any, base_url: str, site_name: str, *, strict_form: bool) 
     if not email and not password:
         return
     if not email or not password:
-        raise ValueError(f"Для входа укажи {credential_prefix}_EMAIL и {credential_prefix}_PASSWORD.")
+        raise SourceError("configuration_error", f"Для входа укажи {credential_prefix}_EMAIL и {credential_prefix}_PASSWORD.")
     email_selectors = (
         'input[type="email"]', 'input[name="email"]',
         'input[autocomplete="email"]', 'input[placeholder*="mail" i]',
@@ -819,11 +889,11 @@ def _login_site(page: Any, base_url: str, site_name: str, *, strict_form: bool) 
         'input[autocomplete="current-password"]',
     )
     for login_url in (f"{base_url}/login", f"{base_url}/signin"):
-        response = page.goto(login_url, wait_until="domcontentloaded", timeout=45_000)
+        response = _navigate(page, login_url, wait_until="domcontentloaded", timeout=45_000)
         require_origin(page, base_url)
         if response and response.status in (401, 403):
             if strict_form:
-                raise ValueError(f"{site_name} заблокировал страницу входа (Cloudflare/WAF).")
+                raise SourceError("access_denied", f"{site_name} заблокировал страницу входа (Cloudflare/WAF).", http_status=response.status)
             logging.warning("%s отклонил страницу входа; продолжаем с cookies/API", site_name)
             return
         if strict_form:
@@ -845,11 +915,11 @@ def _login_site(page: Any, base_url: str, site_name: str, *, strict_form: bool) 
         body = str(page.locator("body").inner_text()).lower()
         if any(marker in body for marker in ("cloudflare", "verify you are human", "access denied", "challenge")):
             if strict_form:
-                raise ValueError(f"{site_name} запросил проверку Cloudflare/WAF.")
+                raise SourceError("challenge_required", f"{site_name} запросил проверку Cloudflare/WAF.")
             logging.warning("%s запросил проверку; продолжаем с cookies/API", site_name)
             return
         if strict_form:
-            raise ValueError(f"Не удалось открыть форму входа {site_name}.")
+            raise SourceError("login_failed", f"Не удалось открыть форму входа {site_name}.")
         logging.info("Форма входа %s не найдена; продолжаем с текущей сессией", site_name)
         return
     if strict_form:
@@ -862,11 +932,13 @@ def _login_site(page: Any, base_url: str, site_name: str, *, strict_form: bool) 
                 timeout=20_000,
             )
         except Exception as exc:
-            raise ValueError(f"{site_name} не загрузил обработчик формы входа.") from exc
+            raise SourceError("login_failed", f"{site_name} не загрузил обработчик формы входа.") from None
         _dismiss_janitor_locale_modal(page)
     require_origin(page, base_url)
-    email_input.fill(email)
-    password_input.fill(password)
+    with trace.operation('login_email', timeout_ms=30000):
+        email_input.fill(email, timeout=30000)
+    with trace.operation('login_password', timeout_ms=30000):
+        password_input.fill(password, timeout=30000)
     submit = _visible_locator(page, (
         'button[type="submit"]', 'input[type="submit"]',
         'button:has-text("Sign in")', 'button:has-text("Log in")',
@@ -878,7 +950,8 @@ def _login_site(page: Any, base_url: str, site_name: str, *, strict_form: bool) 
         logging.info("Кнопка входа %s не найдена; продолжаем с текущей сессией", site_name)
         return
     require_origin(page, base_url)
-    submit.click()
+    with trace.operation('login_submit', timeout_ms=30000):
+        submit.click(timeout=30000)
     if strict_form:
         resubmitted = False
         for _ in range(45):
@@ -960,6 +1033,7 @@ def _datacat_headers(token: str = "") -> dict[str, str]:
 
 
 def _datacat_json(method: str, path: str, *, token: str = "", body: dict[str, Any] | None = None) -> tuple[int, Any]:
+    trace.emit('request_variant', operation='datacat_api', reason='source_kind_janitor' if '?sourceKind=janitor' in path else 'default')
     data = None
     headers = _datacat_headers(token)
     if body is not None:
@@ -968,11 +1042,18 @@ def _datacat_json(method: str, path: str, *, token: str = "", body: dict[str, An
     status, _, raw, _ = fetch(f"{DATACAT_BASE}{path}", method=method, headers=headers,
                              body=data, limit=JSON_RESPONSE_LIMIT, timeout=60, redirects=0,
                              domains=("datacat.run",))
-    if status >= 400:
-        return status, None
-    return status, json.loads(raw) if raw else None
+    try:
+        payload = json.loads(raw) if raw else None
+    except json.JSONDecodeError as exc:
+        if status >= 400:
+            return status, None
+        raise SourceError("invalid_response", http_status=status) from exc
+    if isinstance(payload, dict) and payload.get('code') == 'CREATOR_REDIRECT_REQUIRED':
+        raise SourceError('creator_redirect_required', http_status=status)
+    return status, payload
 
 
+@trace.traced('datacat_identify')
 def _datacat_session_token() -> str:
     status, data = _datacat_json(
         "POST",
@@ -981,7 +1062,8 @@ def _datacat_session_token() -> str:
     )
     token = data.get("sessionToken") if isinstance(data, dict) else ""
     if status != 200 or not token:
-        raise ValueError("Не удалось открыть DataCat session.")
+        raise SourceError("http_error" if status != 200 else "invalid_response",
+                          "Не удалось открыть DataCat session.", http_status=status)
     return str(token)
 
 
@@ -989,14 +1071,15 @@ def _datacat_character_url(character_id: str) -> str:
     return f"https://janitorai.com/characters/{character_id}"
 
 
+@trace.traced('datacat_lookup')
 def _fetch_datacat_character(uuid_part: str, token: str) -> dict[str, Any] | None:
     for query in ("?sourceKind=janitor", ""):
         status, data = _datacat_json("GET", f"/api/characters/{uuid_part}{query}", token=token)
         if status == 200 and isinstance(data, dict) and isinstance(data.get("character"), dict):
             return data["character"]
         if status not in (200, 404):
-            raise ValueError(f"DataCat API: HTTP {status}.")
-    return None
+            raise SourceError("http_error", http_status=status)
+    raise SourceError("not_found" if status == 404 else "invalid_response", http_status=status)
 
 
 def _datacat_definition_available(character: dict[str, Any], data: dict[str, Any]) -> bool:
@@ -1033,9 +1116,11 @@ def _datacat_card_from_character(character: dict[str, Any]) -> dict[str, Any]:
                     "definition_available": _datacat_definition_available(character, data),
                 }
             )
-            return card
+            return lorebooks.attach(character, card)
 
     raw = {
+        "scripts": character.get('scripts') or [],
+        "character_book": character.get('character_book'),
         "name": character.get("name") or character.get("chat_name"),
         "description": character.get("description") or character.get("personality"),
         "personality": _definition_text(character),
@@ -1068,9 +1153,10 @@ def _datacat_image_url(character: dict[str, Any], card: dict[str, Any]) -> str:
             continue
         candidate = candidate.strip()
         return candidate if candidate.startswith(("http://", "https://", "data:image/")) else f"{DATACAT_JANITOR_IMAGE_BASE}{candidate}"
-    raise ValueError("DataCat не вернул изображение персонажа.")
+    raise SourceError("missing_image", "DataCat не вернул изображение персонажа.")
 
 
+@trace.traced('download_image')
 def _download_url_image_body(image_url: str, page_url: str) -> bytes:
     if image_url.startswith("data:image/") and ";base64," in image_url:
         if len(image_url) > IMAGE_RESPONSE_LIMIT * 4 // 3 + 256:
@@ -1082,8 +1168,10 @@ def _download_url_image_body(image_url: str, page_url: str) -> bytes:
     status, headers, body, _ = fetch(urljoin(page_url, image_url),
                                     headers={"User-Agent": "Mozilla/5.0", "Referer": page_url},
                                     limit=IMAGE_RESPONSE_LIMIT)
-    if status != 200 or not headers.get("content-type", "").lower().startswith("image/"):
-        raise ValueError("Сервер не вернул допустимое изображение.")
+    if status != 200:
+        raise SourceError("http_error", http_status=status)
+    if not headers.get("content-type", "").lower().startswith("image/"):
+        raise SourceError("image_invalid", "Сервер не вернул допустимое изображение.", http_status=status)
     return body
 
 
@@ -1093,7 +1181,7 @@ def _download_datacat_character_sync(character_id: str) -> str:
     token = _datacat_session_token()
     character = _fetch_datacat_character(uuid_part, token)
     if not character:
-        raise ValueError("DataCat не вернул карточку персонажа.")
+        raise SourceError("not_found", "DataCat не вернул карточку персонажа.")
 
     card = _datacat_card_from_character(character)
     page_url = _datacat_character_url(character_id)
@@ -1114,6 +1202,7 @@ def _download_janitor_character_sync(character_id: str) -> str:
     page_url = f"https://janitorai.com/characters/{character_id}"
     file_path = _character_file_path()
     browser = _launch()
+    context = None
     payloads: list[Any] = []
 
     try:
@@ -1128,10 +1217,10 @@ def _download_janitor_character_sync(character_id: str) -> str:
 
         page.on("response", lambda response: _capture_json_response(response, payloads, ("janitorai.com",)))
         logging.info("Открываем Janitor страницу через Chromium: %s", page_url)
-        response = page.goto(page_url, wait_until="domcontentloaded", timeout=45_000)
+        response = _navigate(page, page_url, wait_until="domcontentloaded", timeout=45_000)
         require_origin(page)
         if response and response.status in (401, 403):
-            raise ValueError("Janitor AI отклонил доступ: проверь авторизацию или Cloudflare/WAF.")
+            raise SourceError("access_denied", "Janitor AI отклонил доступ: проверь авторизацию или Cloudflare/WAF.", http_status=response.status)
         try:
             page.wait_for_load_state("networkidle", timeout=15_000)
         except Exception:
@@ -1161,6 +1250,9 @@ def _download_janitor_character_sync(character_id: str) -> str:
         _write_chara_png(image_body, card, file_path)
         logging.info("Janitor PNG с metadata сохранен: %s", file_path)
         return file_path
+    except Exception as exc:
+        remove_download(file_path)
+        raise _context_failure(context, exc) from None
     except BaseException:
         remove_download(file_path)
         raise
@@ -1178,6 +1270,14 @@ def _download_candidate_sync(
             raise ValueError("Карточка слишком большая.")
         card = _read_card(path)
         definition_available = _card_definition_available(card.get("data", card))
+        trace.emit('card_ready', definition_available=definition_available,
+                   embedded_book=isinstance(card.get('data', {}).get('character_book'), dict),
+                   bytes=os.path.getsize(path))
+        metadata = card.get('data', {}).get('extensions', {}).get('download_bot', {})
+        if isinstance(metadata, dict):
+            trace.emit('completed', operation='lorebooks',
+                       books=len(metadata.get('lorebooks', [])) if isinstance(metadata.get('lorebooks', []), list) else 0,
+                       missing=metadata.get('lorebooks_missing', 0))
         notice = None
         if source == DownloadSource.PROXY and definition_available and not has_verified_hidden_definition(path):
             notice = "Открытое определение получено с JanitorAI."

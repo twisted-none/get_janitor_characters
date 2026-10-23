@@ -10,6 +10,8 @@ from typing import Any
 from uuid import uuid4
 from urllib.parse import unquote
 from security_policy import require_origin, require_public
+from download_errors import SourceError
+import download_trace as trace
 
 
 _FETCH_SCRIPT = """
@@ -80,22 +82,25 @@ def get_access_token(page: Any, context: Any) -> str:
     return ""
 
 
+@trace.traced('janitor_api')
 def _api_json(page: Any, token: str, path: str, method: str = "GET", body: Any = None) -> dict[str, Any]:
     require_origin(page)
     if not path.startswith(("/mb/characters/", "/mb/chats", "/generateAlpha")) or ".." in path:
         raise ValueError("Недопустимый путь Janitor API")
+    trace.emit('request', operation='janitor_api', method=method, endpoint=trace.endpoint('https://janitorai.com' + path))
     result = page.evaluate(_FETCH_SCRIPT, {
         "path": path, "token": token, "method": method, "body": body,
         "requestId": str(uuid4()) if path == "/generateAlpha" else "",
     })
+    trace.emit('response', operation='janitor_api', http_status=result['status'], bytes=len(result['text']))
     if not 200 <= result["status"] < 300:
-        raise ValueError(f"Janitor {path}: HTTP {result['status']}")
+        raise SourceError("http_error", http_status=result["status"])
     if len(result["text"]) > 8_000_000:
-        raise ValueError(f"Janitor {path}: ответ слишком большой")
+        raise SourceError("response_too_large", "Ответ Janitor слишком большой.")
     try:
         payload = json.loads(result["text"])
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Janitor {path}: ответ не JSON") from exc
+        raise SourceError("invalid_response", http_status=result["status"]) from exc
     if not isinstance(payload, dict):
         raise ValueError(f"Janitor {path}: неверный формат ответа")
     return payload
@@ -118,14 +123,15 @@ def parse_definition(system_content: str, character_name: str) -> dict[str, str]
     return result
 
 
+@trace.traced('proxy_definition')
 def extract_definition(page: Any, context: Any, character_id: str) -> dict[str, str]:
     token = get_access_token(page, context)
     if not token:
-        raise ValueError("Для скрытого определения нужна авторизованная сессия Janitor")
+        raise SourceError("auth_required", "Для скрытого определения нужна авторизованная сессия Janitor")
     character = _api_json(page, token, f"/mb/characters/{character_id}")
     require_public(character)
     if not character.get("allow_proxy"):
-        raise ValueError("Автор персонажа отключил внешний прокси")
+        raise SourceError("proxy_disabled", "Автор персонажа отключил внешний прокси")
     chat = _api_json(page, token, "/mb/chats", "POST", {"character_id": character_id})
     chat_id, user_id = chat.get("id"), chat.get("user_id")
     if not chat_id or not user_id:

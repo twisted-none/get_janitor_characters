@@ -79,6 +79,18 @@ class AnalyticsStore:
                 ("success" if success else "error", error[:500], download_id),
             )
 
+    def get_lorebook_mode(self, user_id: int) -> str:
+        with self.lock, self._connect() as db:
+            row = db.execute('SELECT lorebook_mode FROM user_preferences WHERE user_id = %s', (user_id,)).fetchone()
+        return row['lorebook_mode'] if row else 'separate'
+
+    def set_lorebook_mode(self, user_id: int, mode: str) -> None:
+        if mode not in ('separate', 'embedded', 'both'):
+            raise ValueError('invalid_lorebook_mode')
+        with self.lock, self._connect() as db:
+            db.execute('INSERT INTO user_preferences (user_id, lorebook_mode) VALUES (%s, %s) '
+                       'ON CONFLICT (user_id) DO UPDATE SET lorebook_mode = EXCLUDED.lorebook_mode', (user_id, mode))
+
     def broadcast_recipients(self) -> list[int]:
         with self.lock, self._connect() as db:
             return [int(row["user_id"]) for row in db.execute(
@@ -122,6 +134,9 @@ class AnalyticsStore:
 
     def _initialize(self) -> None:
         with self.lock, self._connect() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS user_preferences (user_id BIGINT PRIMARY KEY, "
+                       "lorebook_mode TEXT NOT NULL DEFAULT 'separate' "
+                       "CHECK (lorebook_mode IN ('separate', 'embedded', 'both')))")
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bot_users (

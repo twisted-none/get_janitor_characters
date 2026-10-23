@@ -77,6 +77,19 @@ class DownloadPipelineTests(unittest.IsolatedAsyncioTestCase):
         data = self.datacat_data(True)
         self.assertFalse(parser._card_definition_available(data))
 
+    async def test_public_browser_failure_keeps_existing_proxy_fallback(self):
+        from download_errors import SourceError
+        proxy = self.card_file('proxy_fallback', {
+            'name': 'Ada', 'description': 'Definition', 'first_mes': 'Hello',
+        })
+        with (
+            patch.object(parser, '_download_datacat_character_sync', side_effect=SourceError('not_found')),
+            patch.object(parser, '_download_janny_character_sync', side_effect=SourceError('challenge_required')),
+            patch.object(parser, '_download_janitor_character_sync', return_value=proxy),
+        ):
+            result = await parser.download_card('abc', isolated=False)
+        self.assertEqual(result.source, DownloadSource.PROXY)
+
     def test_datacat_tavern_description_can_hold_actual_definition(self) -> None:
         character = {
             "name": "Ada", "description": "Public profile", "first_message": "Hello",

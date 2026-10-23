@@ -70,6 +70,9 @@ from download_status import DownloadStatus, active_status, queue_status
 from download_queue import DownloadQueue, QueueFull
 from analytics import AnalyticsStore
 from metrics import run_metrics_server
+from card_delivery import deliver
+import lorebooks
+import download_trace as trace
 
 bot = Bot(token=TOKEN)
 alert_bot = Bot(token=ALERT_BOT_TOKEN) if ALERT_BOT_TOKEN else None
@@ -123,6 +126,48 @@ async def handle_help(message: types.Message) -> None:
     if not message.from_user:
         return
     await _begin_support(message, message.from_user.id)
+
+
+def _settings_keyboard(mode):
+    labels = {'separate': 'Отдельными JSON', 'embedded': 'Внутри PNG', 'both': 'PNG и JSON'}
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=('✓ ' if value == mode else '') + label,
+                             callback_data='settings:lorebooks:' + value)
+    ] for value, label in labels.items()])
+
+
+@dp.message(Command('settings'))
+async def handle_settings(message: types.Message, analytics_store: AnalyticsStore) -> None:
+    if not message.from_user or message.chat.type != 'private':
+        await message.answer('Открой настройки в личном чате с ботом.')
+        return
+    _clear_dialog(message.from_user.id, message.chat.id)
+    try:
+        mode = await asyncio.to_thread(analytics_store.get_lorebook_mode, message.from_user.id)
+    except Exception:
+        await message.answer('Не удалось загрузить настройки. Попробуй позже.')
+        return
+    await message.answer('Лорбуки', reply_markup=_settings_keyboard(mode))
+
+
+@dp.callback_query(F.data.startswith('settings:lorebooks:'))
+async def handle_lorebook_setting(callback: CallbackQuery, analytics_store: AnalyticsStore) -> None:
+    if not callback.message or callback.message.chat.type != 'private':
+        await callback.answer('Настройки доступны в личном чате.', show_alert=True)
+        return
+    mode = (callback.data or '').removeprefix('settings:lorebooks:')
+    if mode not in lorebooks.MODES:
+        await callback.answer('Неизвестный формат.', show_alert=True)
+        return
+    try:
+        await asyncio.to_thread(analytics_store.set_lorebook_mode, callback.from_user.id, mode)
+    except Exception:
+        await callback.answer('Не удалось сохранить настройку.', show_alert=True)
+        return
+    await callback.answer('Сохранено')
+    keyboard = _settings_keyboard(mode)
+    if getattr(callback.message, 'reply_markup', None) != keyboard:
+        await callback.message.edit_reply_markup(reply_markup=keyboard)
 
 
 @dp.message(Command("cancel"))
@@ -281,6 +326,7 @@ async def handle_broadcast_confirm(callback: CallbackQuery, analytics_store: Ana
 
 
 @dp.message(F.text.regexp(CHARACTER_URL_RE))
+@trace.job
 async def handle_link(message: types.Message, analytics_store: AnalyticsStore) -> None:
     match = re.search(CHARACTER_URL_RE, message.text or "")
     if not match:
@@ -288,6 +334,7 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore) -
 
     source = match.group("source").lower()
     character_id = match.group("id")
+    trace.emit('received', character_id=character_id)
     character_url = match.group(0).strip()
     wait_msg = await message.answer(queue_status())
     status_message = wait_msg
@@ -325,8 +372,8 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore) -
             file_path = result.file_path
         logging.info("Файл готов: %s, размер=%s байт", file_path, os.path.getsize(file_path))
         await status.sending()
-        await message.answer_document(document=FSInputFile(file_path, filename=f"{character_id}.png"),
-                                      caption=result.caption)
+        mode = await asyncio.to_thread(analytics_store.get_lorebook_mode, user_id)
+        await deliver(message, result, character_id, mode)
         await _finish_download(analytics_store, download_id, success=True)
         try:
             await status_message.delete()
@@ -411,7 +458,8 @@ def _is_admin(user_id: int) -> bool:
 
 
 def _main_keyboard(user_id: int = 0) -> types.ReplyKeyboardMarkup:
-    rows = [[types.KeyboardButton(text="/start"), types.KeyboardButton(text="/help")]]
+    rows = [[types.KeyboardButton(text="/start"), types.KeyboardButton(text="/help")],
+            [types.KeyboardButton(text='/settings')]]
     if _is_admin(user_id):
         rows.append([types.KeyboardButton(text="/broadcast"), types.KeyboardButton(text="/queue")])
     return types.ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -448,6 +496,7 @@ async def _setup_commands() -> None:
     commands = [types.BotCommand(command=name, description=description) for name, description in (
         ("start", "Начать работу"), ("help", "Написать в поддержку"),
         ("cancel", "Отменить текущее действие"),
+        ('settings', 'Настройки лорбуков'),
     )]
     await bot.set_my_commands(commands)
     await bot.set_chat_menu_button(menu_button=types.MenuButtonCommands())
@@ -509,6 +558,13 @@ async def _notify_admin(message: types.Message, url: str, error: Exception) -> N
         f"URL: {url}\n"
         f"Error type: {type(error).__name__}"
     )
+    if isinstance(error, DownloadFailed):
+        for source, diagnostic in error.diagnostics.items():
+            text += f"\n{source}: {diagnostic['code']}"
+            if diagnostic["http_status"] is not None:
+                text += f" (HTTP {diagnostic['http_status']})"
+            if diagnostic["exit_code"] is not None:
+                text += f" [exit {diagnostic['exit_code']}]"
     try:
         await (alert_bot or message.bot).send_message(ADMIN_CHAT_ID, text)
     except Exception:

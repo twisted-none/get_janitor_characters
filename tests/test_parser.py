@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from PIL import Image
 
 import parser
+from download_errors import SourceError
 
 
 def _sample_png() -> bytes:
@@ -88,6 +89,65 @@ class _FakeBrowser:
 
 
 class ParserTests(unittest.TestCase):
+    def test_downloaded_png_script_books_are_collected_before_raw_metadata_is_removed(self):
+        from download_flow import DownloadResult, DownloadSource
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'fixture.png')
+            card = {'data': {'name': 'Ada', 'first_mes': 'Hi', 'extensions': {'janitorai': {
+                'scripts': [{'type': 'lorebook', 'entries': [{'content': 'Lore'}]}]}}}}
+            parser._write_chara_png(_sample_png(), card, path)
+            parser._mark_download(DownloadResult(path, DownloadSource.JANNYAI, True))
+            metadata = parser._read_card(path)['data']['extensions']
+            self.assertEqual(len(metadata['download_bot']['lorebooks']), 1)
+            self.assertNotIn('scripts', metadata['janitorai'])
+
+    def test_datacat_creator_policy_is_distinct_from_waf(self):
+        body = json.dumps({'code': 'CREATOR_REDIRECT_REQUIRED', 'message': 'fixture-secret'}).encode()
+        with patch.object(parser, 'fetch', return_value=(403, {}, body, 'https://datacat.run')):
+            with self.assertRaises(SourceError) as caught:
+                parser._datacat_json('GET', '/api/characters/fixture')
+        self.assertEqual(caught.exception.code, 'creator_redirect_required')
+        self.assertNotIn('fixture-secret', str(caught.exception))
+
+    def test_datacat_scripts_survive_png_metadata_cleaning(self):
+        card = parser._datacat_card_from_character({'name': 'Ada', 'description': 'Public',
+            'first_message': 'Hi', 'personality': 'Definition', 'scripts': [
+                {'type': 'lorebook', 'id': 'a', 'entries': [{'content': 'A'}]},
+                {'type': 'lorebook', 'id': 'b', 'entries': [{'content': 'B'}]}]})
+        from security_policy import clean_card
+        clean = clean_card(card)
+        self.assertEqual(len(clean['data']['extensions']['download_bot']['lorebooks']), 2)
+
+    def test_datacat_http_status_is_not_lost(self) -> None:
+        with patch.object(parser, "_datacat_json", return_value=(410, None)):
+            with self.assertRaises(SourceError) as caught:
+                parser._fetch_datacat_character("fixture", "fake-token")
+        self.assertEqual(caught.exception.code, "http_error")
+        self.assertEqual(caught.exception.http_status, 410)
+
+    def test_datacat_missing_character_has_explicit_404(self) -> None:
+        with patch.object(parser, "_datacat_json", return_value=(404, None)):
+            with self.assertRaises(SourceError) as caught:
+                parser._fetch_datacat_character("fixture", "fake-token")
+        self.assertEqual(caught.exception.code, "not_found")
+        self.assertEqual(caught.exception.http_status, 404)
+
+    def test_browser_abort_preserves_network_failure(self) -> None:
+        context = Mock()
+        context._download_failure = SourceError("dns_error", error_type="gaierror")
+        context._download_api_status = None
+        error = parser._context_failure(context, RuntimeError("fixture-secret"))
+        self.assertEqual(error.code, "dns_error")
+        self.assertNotIn("fixture-secret", repr(error.to_payload()))
+
+    def test_page_fallback_retains_failed_api_status(self) -> None:
+        context = Mock()
+        context._download_failure = None
+        context._download_api_status = 403
+        error = parser._context_failure(context, SourceError("card_invalid"))
+        self.assertEqual(error.http_status, 403)
+        self.assertEqual(error.code, "card_invalid")
+
     def test_write_chara_png_embeds_decodable_metadata(self) -> None:
         card = {"spec": "chara_card_v2", "spec_version": "2.0", "data": {"name": "Ada"}}
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -298,7 +358,7 @@ class ParserTests(unittest.TestCase):
             patch("safe_http.socket.getaddrinfo", return_value=public),
             patch.object(parser, "_extract_character_from_state", return_value=payload["character"]),
         ):
-            path = parser._download_janny_character_sync("abc_character-harry-potter")
+            path = parser._download_janny_api_sync("abc_character-harry-potter")
 
         with Image.open(path) as image:
             card = json.loads(base64.b64decode(image.info["chara"]).decode("utf-8"))

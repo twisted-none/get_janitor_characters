@@ -20,6 +20,7 @@ tools/*
 !tools/db_backup.py
 !tools/browser_smoke.py
 !tools/database_smoke.py
+!tools/install_janny_browser.py
 .cache
 .npm-cache
 __pycache__/
