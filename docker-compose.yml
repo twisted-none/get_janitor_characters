@@ -25,7 +25,8 @@ services:
       - seccomp:./docker/seccomp-browser.json
     shm_size: 256mb
     mem_limit: 1536m
-    pids_limit: 256
+    # Camoufox and its child processes exceed 256 threads on a 12-core host.
+    pids_limit: 512
     tmpfs:
       - /tmp:rw,nosuid,size=256m,mode=1777
     volumes:

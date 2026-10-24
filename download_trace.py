@@ -6,6 +6,7 @@ from functools import wraps
 import json
 import logging
 import re
+import unicodedata
 from time import monotonic
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -13,6 +14,7 @@ from uuid import uuid4
 from download_errors import describe_error, ERROR_CODES, ERROR_TYPES
 
 _state = ContextVar('download_trace', default=('', '', None))
+_observer = ContextVar('download_trace_observer', default=None)
 _TEXT = {'event', 'operation', 'job', 'source', 'endpoint', 'method', 'code', 'error_type', 'reason', 'content_type', 'character_id'}
 _NUMBERS = {'http_status', 'duration_ms', 'bytes', 'timeout_ms', 'books', 'entries', 'missing', 'exit_code'}
 _BOOLS = {'definition_available', 'embedded_book', 'partial'}
@@ -36,6 +38,35 @@ _VALUES = {
 
 def current_job():
     return _state.get()[0]
+
+
+def clean_title(value):
+    if not isinstance(value, str):
+        return ''
+    return ' '.join(''.join(c for c in value[:2000] if not unicodedata.category(c).startswith('C')
+                           or c in '\n\r\t').split())[:200]
+
+
+def publish_title(value):
+    """Private progress channel: titles never enter diagnostic logs."""
+    title = clean_title(value)
+    if not title:
+        return
+    path = _state.get()[2]
+    if path is not None:
+        try:
+            temporary = path.with_name('title.tmp')
+            temporary.write_text(json.dumps(title), encoding='utf-8')
+            temporary.chmod(0o600)
+            temporary.replace(path.with_name('title.json'))
+        except OSError:
+            pass
+    observer = _observer.get()
+    if observer is not None:
+        try:
+            observer({'event': 'card_title', 'title': title})
+        except Exception as error:
+            logging.warning('Title observer failed: %s', type(error).__name__)
 
 
 def job(function):
@@ -95,9 +126,24 @@ def session(job, source='', path=None):
         _state.reset(token)
 
 
+@contextmanager
+def observe(callback):
+    token = _observer.set(callback)
+    try:
+        yield
+    finally:
+        _observer.reset(token)
+
+
 def emit(event, **fields):
     job, source, path = _state.get()
     record = sanitize(dict(fields, event=event, job=job, source=source))
+    observer = _observer.get()
+    if observer is not None:
+        try:
+            observer(dict(record))
+        except Exception as error:
+            logging.warning('Trace observer failed: %s', type(error).__name__)
     if path is not None:
         try:
             if not path.exists() or path.stat().st_size < MAX_BYTES:

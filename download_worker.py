@@ -11,12 +11,31 @@ import tempfile
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from download_flow import Candidate
+from download_flow import Candidate, DownloadProgress, DownloadPhase, DownloadSource, ProgressCallback, notify_progress
 from download_errors import SourceError, describe_error
 import download_trace as trace
 
 
-async def run_isolated(character_id: str, source: str, timeout: float = 300) -> Candidate:
+def _download_has_started(path: Path) -> bool:
+    try:
+        with path.open('rb') as stream:
+            body = stream.read(trace.MAX_BYTES + 4097)
+        if len(body) > trace.MAX_BYTES + 4096:
+            return False
+        for line in body.splitlines():
+            try:
+                event = trace.sanitize(json.loads(line))
+            except (ValueError, UnicodeError):
+                continue
+            if event.get('event') == 'started' and event.get('operation') == 'download_image':
+                return True
+    except OSError:
+        pass
+    return False
+
+
+async def run_isolated(character_id: str, source: str, timeout: float = 300,
+                       *, on_progress: ProgressCallback | None = None) -> Candidate:
     with tempfile.TemporaryDirectory(prefix="card-job-") as directory:
         root = Path(directory)
         result_path = root / "result.json"
@@ -33,8 +52,35 @@ async def run_isolated(character_id: str, source: str, timeout: float = 300) -> 
             cwd=directory, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=(os.name == "posix"),
         )
+        waiter = asyncio.create_task(process.wait())
+
+        async def wait_with_progress():
+            announced = False
+            title = ''
+            while True:
+                if on_progress is not None:
+                    new_title = title
+                    try:
+                        with root.joinpath('title.json').open('rb') as stream:
+                            body = stream.read(2049)
+                        if len(body) <= 2048:
+                            new_title = trace.clean_title(json.loads(body)) or title
+                    except (OSError, ValueError, UnicodeError):
+                        pass
+                    downloading = announced or _download_has_started(events_path)
+                    if new_title != title or downloading != announced:
+                        title, announced = new_title, downloading
+                        phase = DownloadPhase.DOWNLOADING if downloading else DownloadPhase.CHECKING
+                        await notify_progress(on_progress, DownloadProgress(DownloadSource(source), phase, title))
+                if waiter.done():
+                    return await waiter
+                try:
+                    await asyncio.wait_for(asyncio.shield(waiter), .15)
+                except asyncio.TimeoutError:
+                    continue
+
         try:
-            await asyncio.wait_for(process.wait(), timeout)
+            await asyncio.wait_for(wait_with_progress(), timeout)
             if not result_path.is_file():
                 raise SourceError("worker_failed", exit_code=process.returncode)
             if result_path.stat().st_size > 4096:
@@ -82,6 +128,7 @@ async def run_isolated(character_id: str, source: str, timeout: float = 300) -> 
             if process.returncode is None:
                 process.kill()
             await process.wait()
+            await waiter
             trace.relay(events_path, job, source)
 
 

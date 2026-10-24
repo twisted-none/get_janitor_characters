@@ -66,7 +66,7 @@ logging.basicConfig(
 
 import parser
 from download_flow import DownloadFailed, remove_download
-from download_status import DownloadStatus, active_status, queue_status
+from download_status import DownloadStatus, DownloadJob, card_label, queue_status
 from download_queue import DownloadQueue, QueueFull
 from analytics import AnalyticsStore
 from metrics import run_metrics_server
@@ -88,6 +88,7 @@ broadcast_waiting: set[tuple[int, int]] = set()
 broadcast_pending: dict[tuple[int, int], tuple[float, str, str]] = {}
 notification_times: OrderedDict[tuple[str, int], float] = OrderedDict()
 pending_downloads: set[int] = set()
+download_jobs: dict[str, DownloadJob] = {}
 download_queue = DownloadQueue(DOWNLOAD_CONCURRENCY)
 
 
@@ -325,6 +326,25 @@ async def handle_broadcast_confirm(callback: CallbackQuery, analytics_store: Ana
                          reply_markup=_main_keyboard(callback.from_user.id))
 
 
+@dp.callback_query(F.data.startswith('download:cancel:'))
+async def handle_cancel_download(callback: CallbackQuery) -> None:
+    token = (callback.data or '').removeprefix('download:cancel:')
+    job = download_jobs.get(token)
+    message = callback.message
+    if (job is None or message is None or job.user_id != callback.from_user.id
+            or job.chat_id != message.chat.id or job.message_id != message.message_id
+            or job.task.done()):
+        await callback.answer('Задача уже завершена или недоступна.', show_alert=True)
+        return
+    if job.sending:
+        await callback.answer('Карточка уже отправляется.')
+        return
+    if not job.cancel_requested:
+        job.cancel_requested = True
+        job.task.cancel()
+    await callback.answer('Отменяю загрузку…')
+
+
 @dp.message(F.text.regexp(CHARACTER_URL_RE))
 @trace.job
 async def handle_link(message: types.Message, analytics_store: AnalyticsStore) -> None:
@@ -336,24 +356,31 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore) -
     character_id = match.group("id")
     trace.emit('received', character_id=character_id)
     character_url = match.group(0).strip()
-    wait_msg = await message.answer(queue_status())
+    token = token_hex(12)
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='Отменить загрузку', callback_data=f'download:cancel:{token}'),
+    ]])
+    label = card_label(character_url, character_id)
+    initial_text = f'Карточка: {label}\n{queue_status()}'
+    wait_msg = await message.answer(initial_text, reply_markup=markup, parse_mode=None)
     status_message = wait_msg
-    status: DownloadStatus | None = None
+
+    async def edit_status(text):
+        await wait_msg.edit_text(text, reply_markup=None if job.sending else markup, parse_mode=None)
+
+    status = DownloadStatus(edit_status, initial_text=initial_text, title=label)
     file_path: str | None = None
     user_id = message.from_user.id if message.from_user else 0
-    download_id = await _start_download(analytics_store, user_id, character_id, character_url)
+    download_id = None
+    job = DownloadJob(user_id, message.chat.id, wait_msg.message_id, asyncio.current_task())
+    download_jobs[token] = job
     job_id = id(wait_msg)
     pending_downloads.add(job_id)
     logging.info("Получена ссылка от user_id=%s, source=%s, character_id=%s", user_id, source, character_id)
 
     try:
-        async with download_queue.slot(user_id):
-            status_message = await message.answer(active_status())
-            try:
-                await wait_msg.delete()
-            except TelegramAPIError:
-                logging.warning("Не удалось удалить сообщение очереди")
-            status = DownloadStatus(status_message.edit_text, initial_text=active_status())
+        download_id = await _start_download(analytics_store, user_id, character_id, character_url)
+        async with download_queue.slot(user_id, on_queued=status.queued):
             logging.info(
                 "Старт download slot: source=%s, character_id=%s, concurrency=%s",
                 source,
@@ -370,15 +397,25 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore) -
                 ticker.cancel()
                 await asyncio.gather(ticker, return_exceptions=True)
             file_path = result.file_path
-        logging.info("Файл готов: %s, размер=%s байт", file_path, os.path.getsize(file_path))
-        await status.sending()
-        mode = await asyncio.to_thread(analytics_store.get_lorebook_mode, user_id)
-        await deliver(message, result, character_id, mode)
+            logging.info("Файл готов: %s, размер=%s байт", file_path, os.path.getsize(file_path))
+            job.sending = True
+            await status.sending()
+            mode = await asyncio.to_thread(analytics_store.get_lorebook_mode, user_id)
+            await deliver(message, result, character_id, mode)
         await _finish_download(analytics_store, download_id, success=True)
         try:
             await status_message.delete()
         except TelegramAPIError:
             logging.warning("Не удалось удалить сообщение статуса после отправки карточки")
+    except asyncio.CancelledError:
+        if not job.cancel_requested:
+            raise
+        await status.close()
+        await _finish_download(analytics_store, download_id, success=False, error='cancelled by user')
+        try:
+            await status_message.edit_text('Загрузка отменена.', reply_markup=None, parse_mode=None)
+        except TelegramAPIError:
+            logging.warning('Не удалось показать отмену скачивания')
     except asyncio.TimeoutError:
         logging.exception("Таймаут скачивания персонажа %s", character_id)
         await _finish_download(analytics_store, download_id, success=False, error="download timeout")
@@ -401,6 +438,7 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore) -
         if file_path:
             remove_download(file_path)
         pending_downloads.discard(job_id)
+        download_jobs.pop(token, None)
 
 
 @dp.message()

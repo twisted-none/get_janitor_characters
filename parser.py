@@ -19,7 +19,8 @@ from browser_runtime import launch_browser
 from PIL import Image, PngImagePlugin
 
 from janitor_proxy import extract_definition, get_access_token
-from download_flow import Candidate, DownloadResult, DownloadSource, ProgressCallback, remove_download, run_download_flow
+from download_flow import (Candidate, DownloadResult, DownloadSource, DownloadProgress, DownloadPhase,
+                           ProgressCallback, notify_progress, remove_download, run_download_flow)
 from safe_http import fetch, validate_url
 from download_errors import SourceError, describe_error
 import download_trace as trace
@@ -682,6 +683,7 @@ def _to_chara_card_v2(raw: dict[str, Any]) -> dict[str, Any]:
     }
     if isinstance(raw.get('character_book'), dict):
         card['data']['character_book'] = raw['character_book']
+    trace.publish_title(name)
     return lorebooks.attach(raw, card)
 
 
@@ -1184,6 +1186,7 @@ def _download_datacat_character_sync(character_id: str) -> str:
         raise SourceError("not_found", "DataCat не вернул карточку персонажа.")
 
     card = _datacat_card_from_character(character)
+    trace.publish_title(card.get('data', {}).get('name'))
     page_url = _datacat_character_url(character_id)
     image_url = _datacat_image_url(character, card)
     image_body = _download_url_image_body(image_url, page_url)
@@ -1290,8 +1293,31 @@ def _download_candidate_sync(
 
 async def _download_candidate(
     downloader: Callable[[str], str], character_id: str, source: DownloadSource,
+    *, on_progress: ProgressCallback | None = None,
 ) -> Candidate:
-    worker = asyncio.create_task(asyncio.to_thread(_download_candidate_sync, downloader, character_id, source))
+    loop = asyncio.get_running_loop()
+    announced = False
+    title = ''
+
+    def observe(event):
+        nonlocal announced, title
+        is_title = event.get('event') == 'card_title'
+        starts_image = (not announced and event.get('event') == 'started'
+                        and event.get('operation') == 'download_image')
+        if on_progress is not None and (is_title or starts_image):
+            if is_title:
+                title = trace.clean_title(event.get('title')) or title
+            announced = announced or starts_image
+            phase = DownloadPhase.DOWNLOADING if announced else DownloadPhase.CHECKING
+            notification = asyncio.run_coroutine_threadsafe(
+                notify_progress(on_progress, DownloadProgress(source, phase, title)), loop)
+            try:
+                notification.result(timeout=6)
+            except TimeoutError:
+                notification.cancel()
+
+    with trace.observe(observe):
+        worker = asyncio.create_task(asyncio.to_thread(_download_candidate_sync, downloader, character_id, source))
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
@@ -1312,15 +1338,16 @@ async def download_card(
         raise ValueError("Неподдерживаемый источник персонажа.")
     downloaders = {
         DownloadSource.DATACAT: partial(_download_candidate, _download_datacat_character_sync,
-                                       character_id, DownloadSource.DATACAT),
+                                       character_id, DownloadSource.DATACAT, on_progress=on_progress),
         DownloadSource.JANNYAI: partial(_download_candidate, _download_janny_character_sync,
-                                       character_id, DownloadSource.JANNYAI),
+                                       character_id, DownloadSource.JANNYAI, on_progress=on_progress),
         DownloadSource.PROXY: partial(_download_candidate, _download_janitor_character_sync,
-                                     character_id, DownloadSource.PROXY),
+                                     character_id, DownloadSource.PROXY, on_progress=on_progress),
     }
     if isolated:
         from download_worker import run_isolated
-        downloaders = {stage: partial(run_isolated, character_id, stage.value) for stage in downloaders}
+        downloaders = {stage: partial(run_isolated, character_id, stage.value, on_progress=on_progress)
+                       for stage in downloaders}
     return await run_download_flow(downloaders, on_progress)
 
 

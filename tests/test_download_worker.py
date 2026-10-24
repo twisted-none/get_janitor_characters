@@ -15,6 +15,37 @@ from download_errors import SourceError
 
 
 class WorkerTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(os.name == 'posix', 'Docker/Linux process groups')
+    async def test_user_cancel_kills_child_process_and_removes_job_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory, 'worker.py')
+            ready = Path(directory, 'ready.json')
+            script.write_text(
+                "import subprocess,sys,json,time\nfrom pathlib import Path\n"
+                "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\n"
+                "Path(__file__).with_name('ready.json').write_text(json.dumps([child.pid,str(Path(sys.argv[-1]).parent)]))\n"
+                "time.sleep(60)\n")
+            with patch.object(download_worker, '__file__', str(script)):
+                task = asyncio.create_task(download_worker.run_isolated('fixture', 'jannyai'))
+                try:
+                    for _ in range(200):
+                        if ready.exists():
+                            break
+                        await asyncio.sleep(.01)
+                    self.assertTrue(ready.exists())
+                    pid, job_directory = json.loads(ready.read_text())
+                finally:
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+            self.assertFalse(Path(job_directory).exists())
+            proc = Path(f'/proc/{pid}/stat')
+            for _ in range(100):
+                if not proc.exists() or proc.read_text().split()[2] == 'Z':
+                    break
+                await asyncio.sleep(.01)
+            self.assertTrue(not proc.exists() or proc.read_text().split()[2] == 'Z')
+
     async def test_events_are_relayed_even_when_worker_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             script = Path(directory, 'worker.py')

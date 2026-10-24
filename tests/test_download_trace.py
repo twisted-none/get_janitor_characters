@@ -7,6 +7,33 @@ import download_trace as trace
 
 
 class TraceTests(unittest.TestCase):
+    def test_title_uses_private_bounded_channel_without_diagnostic_logging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events = []
+            with trace.session('a' * 32, 'jannyai', root / 'events.jsonl'), trace.observe(events.append):
+                trace.publish_title('  Название\n <b>тест</b>\u202e ' + 'x' * 500)
+            title = json.loads(root.joinpath('title.json').read_text())
+            self.assertEqual(len(title), 200)
+            self.assertNotIn('\u202e', title)
+            self.assertFalse(root.joinpath('events.jsonl').exists())
+            self.assertEqual(events, [{'event': 'card_title', 'title': title}])
+
+    def test_observer_receives_sanitized_copy_without_changing_saved_events(self):
+        observed = []
+
+        def observe(event):
+            observed.append(dict(event))
+            event['message'] = 'fixture-secret'
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'events.jsonl'
+            with trace.session('a' * 32, 'datacat', path), trace.observe(observe):
+                trace.emit('started', operation='download_image', token='fixture-secret')
+            self.assertNotIn('fixture-secret', path.read_text())
+        self.assertEqual(observed[0]['operation'], 'download_image')
+        self.assertNotIn('token', observed[0])
+
     def test_events_are_bounded_and_never_contain_secrets(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'events.jsonl'

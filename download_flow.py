@@ -1,5 +1,6 @@
 """Ordered, short-circuiting downloads and source-aware result notices."""
 
+import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping
@@ -18,7 +19,27 @@ class DownloadSource(str, Enum):
     LLM = "llm"
 
 
-ProgressCallback = Callable[[DownloadSource], Awaitable[None]]
+class DownloadPhase(str, Enum):
+    CHECKING = 'checking'
+    DOWNLOADING = 'downloading'
+
+
+@dataclass(frozen=True)
+class DownloadProgress:
+    source: DownloadSource
+    phase: DownloadPhase
+    title: str = ''
+
+
+ProgressCallback = Callable[[DownloadSource | DownloadProgress], Awaitable[None]]
+
+
+async def notify_progress(callback: ProgressCallback | None, event: DownloadSource | DownloadProgress) -> None:
+    if callback is not None:
+        try:
+            await asyncio.wait_for(callback(event), timeout=5)
+        except Exception as error:
+            logging.warning('Download status update failed: %s', type(error).__name__)
 
 
 class DownloadFailed(ValueError):
@@ -81,15 +102,11 @@ async def run_download_flow(
     diagnostics = {}
     try:
         for source in DownloadSource:
-            if on_progress:
-                try:
-                    await on_progress(source)
-                except Exception as exc:
-                    logging.warning("Не удалось обновить статус скачивания: %s", type(exc).__name__)
             downloader = downloaders.get(source)
             if downloader is None:
                 logging.info("Источник %s не подключён", source.value)
                 continue
+            await notify_progress(on_progress, source)
             started = monotonic()
             trace.emit('source_started', operation=source.value)
             try:

@@ -1,27 +1,58 @@
-# Git and local development tools
+# Deployment exclusions. The production .env is intentionally INCLUDED.
+# Keep Dockerfile, .dockerignore, docker-compose.yml, lock files, Python modules,
+# docker/seccomp-browser.json and every tool explicitly copied by Dockerfile.
+
+# Git, editor and agent files
 .git/
 .agents/
+.codex/
+.aws/
+.idea/
+.vscode/
 .gitignore
 .graphifyignore
 .python-version
 
-# Caches, local environments and project graph
+# Local caches, downloaded browsers, environments and generated graph
 .cache/
+.npm-cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+node_modules/
 graphify-out/
+__pycache__/
 **/__pycache__/
+*.pyc
+*.pyo
+*.log
+*.tmp
+*.part
+*.bak
 
-# Tests and local development utilities
+# Tests and local-only utilities; keep production/build tools
 tests/
 docker/Dockerfile.local-check
 tools/resolve_lock.py
 janitor_login.py
 tampermonkey_janitor_export.user.js
 
-# Local cookies and example configuration
+# Local sessions and alternate/example env files; .env itself stays included
 current_cookies.txt
-.env.example
+current_ua.txt
+*auth_state*
+*storage_state*
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
 
-# Documentation not required at runtime
-DOWNLOAD_FLOW.md
-PREDEPLOY.md
-SECURITY_FIXES.md
+# Documentation and local build output
+*.md
+dist/
+build/
+*.egg-info/

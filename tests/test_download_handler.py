@@ -8,9 +8,10 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from secrets import token_hex
 
-from download_flow import DownloadFailed, DownloadResult, DownloadSource, remove_download
-from download_status import DownloadStatus, active_status, queue_status
+from download_flow import DownloadFailed, DownloadResult, DownloadSource, DownloadProgress, DownloadPhase, remove_download
+from download_status import DownloadStatus, DownloadJob, card_label, active_status, queue_status
 from download_queue import DownloadQueue, QueueFull
 import download_trace as trace
 
@@ -31,13 +32,18 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name, "character.png")
         self.path.write_bytes(b"PNG test fixture")
-        self.queue_msg = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock())
-        self.wait_msg = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock())
+        self.queue_msg = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock(), message_id=11)
+        self.wait_msg = self.queue_msg
         self.message = SimpleNamespace(
             text="https://janitorai.com/characters/abc", from_user=SimpleNamespace(id=7),
-            answer=AsyncMock(side_effect=[self.queue_msg, self.wait_msg]), answer_document=AsyncMock(),
+            chat=SimpleNamespace(id=10),
+            answer=AsyncMock(return_value=self.wait_msg), answer_document=AsyncMock(),
         )
         self.scope = {
+            'download_jobs': {}, 'DownloadJob': DownloadJob, 'card_label': card_label,
+            'token_hex': token_hex,
+            'InlineKeyboardMarkup': lambda **kwargs: kwargs,
+            'InlineKeyboardButton': lambda **kwargs: kwargs,
             "re": re, "asyncio": asyncio, "logging": logging, "os": os, 'trace': trace,
             "CHARACTER_URL_RE": ast.literal_eval(assignment.value),
             "DownloadStatus": DownloadStatus, "active_status": active_status,
@@ -55,17 +61,74 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.scope['deliver'] = deliver_fixture
         code = "from __future__ import annotations\n" + ast.unparse(ast.Module(body=[handler], type_ignores=[]))
         exec(compile(code, "main.py", "exec"), self.scope)
+        callback = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
+                        and node.name == 'handle_cancel_download')
+        callback.decorator_list = []
+        exec(compile('from __future__ import annotations\n' + ast.unparse(
+            ast.Module(body=[callback], type_ignores=[])), 'main.py', 'exec'), self.scope)
         original = self.scope['handle_link']
         self.preferences = SimpleNamespace(get_lorebook_mode=lambda _: 'separate')
         async def with_preferences(message, store):
             await original(message, store or self.preferences)
         self.scope['handle_link'] = with_preferences
 
+    async def test_cancel_active_download_cleans_worker_before_releasing_slot(self):
+        started, stopping, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def download(*args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopping.set()
+                await finish.wait()
+
+        self.scope['parser'] = SimpleNamespace(download_card=download)
+        task = asyncio.create_task(self.scope['handle_link'](self.message, None))
+        await asyncio.wait_for(started.wait(), 5)
+        token = next(iter(self.scope['download_jobs']))
+        callback = SimpleNamespace(data='download:cancel:' + token, from_user=SimpleNamespace(id=8),
+                                   message=SimpleNamespace(chat=self.message.chat,
+                                                           message_id=self.wait_msg.message_id), answer=AsyncMock())
+        await self.scope['handle_cancel_download'](callback)
+        self.assertFalse(stopping.is_set())
+        callback.from_user.id = 7
+        await self.scope['handle_cancel_download'](callback)
+        await asyncio.wait_for(stopping.wait(), 5)
+        self.assertEqual(self.scope['download_queue']._active, 1)
+        await self.scope['handle_cancel_download'](callback)  # A second click must not interrupt cleanup.
+        finish.set()
+        await asyncio.wait_for(task, 5)
+        self.assertFalse(self.scope['download_jobs'])
+        self.assertEqual(self.scope['download_queue']._active, 0)
+        self.message.answer_document.assert_not_awaited()
+        self.assertIn('отменена', self.wait_msg.edit_text.await_args.args[0])
+        self.scope['_notify_admin'].assert_not_awaited()
+
+    async def test_cancel_queued_download_does_not_cancel_active_job(self):
+        self.configure_download(DownloadSource.DATACAT)
+        async with self.scope['download_queue'].slot(99):
+            task = asyncio.create_task(self.scope['handle_link'](self.message, None))
+            for _ in range(100):
+                if self.scope['download_jobs']:
+                    break
+                await asyncio.sleep(.01)
+            token = next(iter(self.scope['download_jobs']))
+            callback = SimpleNamespace(data='download:cancel:' + token, from_user=self.message.from_user,
+                                       message=SimpleNamespace(chat=self.message.chat,
+                                                               message_id=self.wait_msg.message_id), answer=AsyncMock())
+            await self.scope['handle_cancel_download'](callback)
+            await asyncio.wait_for(task, 5)
+            self.assertEqual(self.scope['download_queue']._active, 1)
+            self.scope['parser'].download_card.assert_not_awaited()
+        self.message.answer_document.assert_not_awaited()
+
     def configure_download(self, source: DownloadSource, complete: bool = True) -> None:
         async def download(_character_id: str, *, source: str, on_progress: DownloadStatus) -> DownloadResult:
             for stage in DownloadSource:
                 await on_progress(stage)
                 if stage == selected:
+                    await on_progress(DownloadProgress(stage, DownloadPhase.DOWNLOADING))
                     break
             return DownloadResult(str(self.path), selected, complete, llm_available=False)
 
@@ -76,10 +139,11 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.configure_download(DownloadSource.DATACAT)
         await self.scope["handle_link"](self.message, SimpleNamespace(get_lorebook_mode=lambda _: 'separate'))
         self.assertIsNone(self.message.answer_document.await_args.kwargs["caption"])
-        self.assertEqual(self.message.answer.await_count, 2)
-        self.queue_msg.delete.assert_awaited_once()
-        self.assertEqual(self.wait_msg.edit_text.await_count, 2)
+        self.assertEqual(self.message.answer.await_count, 1)
+        self.assertEqual(self.wait_msg.edit_text.await_count, 3)
         self.assertIn("DataCat", self.wait_msg.edit_text.await_args_list[0].args[0])
+        self.assertIn('Проверяю', self.wait_msg.edit_text.await_args_list[0].args[0])
+        self.assertIn('Скачиваю с DataCat', self.wait_msg.edit_text.await_args_list[1].args[0])
         self.assertIn("100%", self.wait_msg.edit_text.await_args_list[-1].args[0])
         self.wait_msg.delete.assert_awaited_once()
         self.assertFalse(self.path.exists())
@@ -88,9 +152,9 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_proxy_uses_one_status_message_and_keeps_source_notice(self) -> None:
         self.configure_download(DownloadSource.PROXY)
         await self.scope["handle_link"](self.message, None)
-        self.assertEqual(self.message.answer.await_count, 2)
+        self.assertEqual(self.message.answer.await_count, 1)
         texts = [call.args[0] for call in self.wait_msg.edit_text.await_args_list]
-        self.assertEqual(len(texts), 4)
+        self.assertEqual(len(texts), 5)
         self.assertIn("proxy", self.message.answer_document.await_args.kwargs["caption"])
 
     async def test_localized_link_downloads_the_character_not_the_locale(self) -> None:
@@ -131,20 +195,50 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.scope["_finish_download"].assert_awaited_once_with(self.preferences, 1, success=True)
         self.scope["_notify_admin"].assert_not_awaited()
 
-    async def test_queue_message_is_replaced_when_slot_opens(self) -> None:
+    async def test_queue_message_shows_position_and_is_reused_when_slot_opens(self) -> None:
         self.configure_download(DownloadSource.DATACAT)
         slot = self.scope["download_queue"].slot(99)
         await slot.__aenter__()
         task = asyncio.create_task(self.scope["handle_link"](self.message, None))
-        await asyncio.sleep(0)
+        for _ in range(20):
+            if self.queue_msg.edit_text.await_count:
+                break
+            await asyncio.sleep(.01)
         self.assertIn("0%", self.message.answer.await_args.args[0])
-        self.assertIn("ожидает", self.message.answer.await_args.args[0])
+        self.assertIn('Место в очереди: 2', self.queue_msg.edit_text.await_args.args[0])
+        self.assertIn('Примерное ожидание:', self.queue_msg.edit_text.await_args.args[0])
         await slot.__aexit__(None, None, None)
         await task
-        self.assertEqual(self.message.answer.await_count, 2)
-        self.queue_msg.delete.assert_awaited_once()
-        self.assertIn("скачивается", self.message.answer.await_args.args[0])
+        self.assertEqual(self.message.answer.await_count, 1)
         self.wait_msg.delete.assert_awaited_once()
+
+    async def test_queue_slot_is_held_until_card_delivery_finishes(self):
+        self.configure_download(DownloadSource.DATACAT)
+        sending = asyncio.Event()
+        release = asyncio.Event()
+
+        async def deliver(*args):
+            sending.set()
+            await release.wait()
+
+        self.scope['deliver'] = deliver
+        task = asyncio.create_task(self.scope['handle_link'](self.message, None))
+        try:
+            await asyncio.wait_for(sending.wait(), 5)
+            self.assertEqual(self.scope['download_queue']._active, 1)
+            token = next(iter(self.scope['download_jobs']))
+            callback = SimpleNamespace(data='download:cancel:' + token, from_user=self.message.from_user,
+                                       message=SimpleNamespace(chat=self.message.chat,
+                                                               message_id=self.wait_msg.message_id), answer=AsyncMock())
+            await self.scope['handle_cancel_download'](callback)
+            self.assertFalse(task.cancelling())
+            self.assertIsNone(self.wait_msg.edit_text.await_args.kwargs['reply_markup'])
+        finally:
+            release.set()
+            await task
+        self.assertEqual(self.scope['download_queue']._active, 0)
+        await self.scope['handle_cancel_download'](callback)
+        self.assertIn('завершена', callback.answer.await_args.args[0])
 
     async def test_final_error_does_not_mention_llm(self) -> None:
         self.scope["parser"] = SimpleNamespace(download_card=AsyncMock(side_effect=DownloadFailed()))
