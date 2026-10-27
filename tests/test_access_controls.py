@@ -38,6 +38,7 @@ class AccessControlTests(unittest.IsolatedAsyncioTestCase):
         await self.scope["_notify_admin"](message, "https://example.invalid/fixture", error)
         text = message.bot.send_message.await_args.args[1]
         self.assertIn("datacat: http_error (HTTP 410)", text)
+        self.assertIn('User: @fixture\n', text)
         self.assertNotIn("fixture-secret", text)
 
     async def test_non_admin_and_group_cannot_start_broadcast(self):

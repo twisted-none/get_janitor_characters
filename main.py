@@ -71,7 +71,7 @@ from download_status import DownloadStatus, DownloadJob, card_label, queue_statu
 from download_queue import DownloadQueue, QueueFull
 from download_retries import RetryStore, run_retries, waiting_text, EXHAUSTED_TEXT, MAX_ATTEMPTS
 from alert_retries import AlertRetryStore
-from alert_redelivery import AlertRedelivery, PREFIX as ALERT_RETRY_PREFIX, start_alert_server
+from alert_redelivery import AlertRedelivery, PREFIX as ALERT_RETRY_PREFIX, start_alert_server, restore_user
 from analytics import AnalyticsStore
 from metrics import run_metrics_server
 from card_delivery import deliver
@@ -389,10 +389,12 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore,
     ]])
     label = retry_request['title'] if retry_request else card_label(character_url, character_id)
     initial_text = f'Карточка: {label}\n{queue_status()}'
-    wait_msg = message if retry_request else await message.answer(initial_text, reply_markup=markup, parse_mode=None)
+    wait_msg = message if retry_request or redelivery else await message.answer(initial_text, reply_markup=markup, parse_mode=None)
     status_message = wait_msg
 
     async def edit_status(text):
+        if redelivery is not None:
+            return
         await wait_msg.edit_text(text, reply_markup=None if job.sending else markup, parse_mode=None)
 
     status = DownloadStatus(edit_status, initial_text=initial_text, title=label)
@@ -444,7 +446,8 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore,
                 delivered = await deliver(message, result, character_id, mode)
         await _finish_download(analytics_store, download_id, success=True)
         try:
-            await status_message.delete()
+            if redelivery is None:
+                await status_message.delete()
         except TelegramAPIError:
             logging.warning("Не удалось удалить сообщение статуса после отправки карточки")
         return delivered is not False if redelivery else True
@@ -457,6 +460,8 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore,
         await _finish_download(analytics_store, download_id, success=False, error="download timeout")
         if redelivery is None:
             await _notify_admin(message, character_url, TimeoutError("download timeout"), alert_service=alert_service)
+        else:
+            return False
         await status_message.edit_text(
             "Скачивание заняло слишком много времени. Попробуй позже или напиши в поддержку через /help.",
             reply_markup=_support_keyboard(),
@@ -479,6 +484,8 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore,
                                message_id=wait_msg.message_id, chat_type=getattr(message.chat, 'type', 'private'),
                                character_id=character_id, url=character_url, title=status.title,
                                completed_attempts=attempt)
+                request['username'] = getattr(message.from_user, 'username', None) or ''
+                request['full_name'] = getattr(message.from_user, 'full_name', '') or ''
                 try:
                     deferred = await asyncio.to_thread(retry_store.schedule, request, resumed=bool(retry_request))
                 except Exception as error:
@@ -497,6 +504,8 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore,
                     return
         if redelivery is None:
             await _notify_admin(message, character_url, e, alert_service=alert_service)
+        else:
+            return False
         error_text = (str(e) if isinstance(e, (DownloadFailed, QueueFull)) else
                       "Не удалось скачать персонажа. Проверь, что страница доступна, и попробуй снова.")
         await status_message.edit_text(error_text + " Если ошибка повторяется, напиши в поддержку через /help.",
@@ -511,7 +520,7 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore,
                 await asyncio.to_thread(retry_store.finish, token)
             except Exception as error:
                 logging.warning('Cannot finish card retry: %s', type(error).__name__)
-        if job.cancel_requested:
+        if job.cancel_requested and redelivery is None:
             try:
                 await status_message.edit_text('Загрузка отменена.', reply_markup=None, parse_mode=None)
             except TelegramAPIError:
@@ -554,8 +563,7 @@ async def main() -> None:
     async def resume(request):
         message = types.Message(message_id=request['message_id'], date=datetime.now(UTC), text=request['url'],
                                 chat=types.Chat(id=request['chat_id'], type=request['chat_type']),
-                                from_user=types.User(id=request['user_id'], is_bot=False,
-                                                     first_name='Пользователь')).as_(bot)
+                                from_user=await restore_user(request, analytics_store)).as_(bot)
         await handle_link(message, analytics_store, retry_store=retry_store, retry_request=request,
                           alert_service=alert_service)
 
@@ -698,7 +706,7 @@ async def _notify_admin(message: types.Message, url: str, error: Exception, *, a
     user = message.from_user
     if not _allow_notification("error", user.id if user else 0, 60):
         return
-    user_name = (user.username or user.full_name) if user else "unknown"
+    user_name = (f'@{user.username}' if user.username else user.full_name) if user else "unknown"
     text = (
         "Janny Bot error\n"
         f"User: {user_name}\n"

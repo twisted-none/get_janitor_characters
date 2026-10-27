@@ -36,6 +36,8 @@ class RetryStore:
                 due_at TIMESTAMPTZ NOT NULL
             )''')
             db.execute('CREATE INDEX IF NOT EXISTS idx_card_retries_due ON pending_card_retries (state, due_at)')
+            db.execute("ALTER TABLE pending_card_retries ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT ''")
+            db.execute("ALTER TABLE pending_card_retries ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''")
 
     def _connect(self):
         return psycopg.connect(self._url, autocommit=True, row_factory=dict_row, connect_timeout=10,
@@ -54,11 +56,12 @@ class RetryStore:
                      request['token'])).fetchone() is not None
             return db.execute('''INSERT INTO pending_card_retries
                 (token, user_id, chat_id, message_id, chat_type, character_id, url, title,
-                 completed_attempts, state, due_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'waiting', now() + %s * interval '1 second')
+                 completed_attempts, username, full_name, state, due_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'waiting', now() + %s * interval '1 second')
                 ON CONFLICT (token) DO NOTHING RETURNING token''',
                 tuple(request[key] for key in ('token', 'user_id', 'chat_id', 'message_id', 'chat_type',
-                      'character_id', 'url', 'title', 'completed_attempts')) + (RETRY_DELAY_SECONDS,)).fetchone() is not None
+                      'character_id', 'url', 'title', 'completed_attempts')) +
+                (request.get('username', ''), request.get('full_name', ''), RETRY_DELAY_SECONDS,)).fetchone() is not None
 
     def exists(self, token):
         with self._lock, self._connect() as db:

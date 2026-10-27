@@ -29,12 +29,15 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         error = TelegramBadRequest(method=SendDocument(chat_id=1, document='fixture'), message='fixture failure')
         message = SimpleNamespace(answer_document=AsyncMock(side_effect=[None, error]), answer=AsyncMock())
-        result = SimpleNamespace(file_path='fixture', caption=None)
+        result = SimpleNamespace(file_path='fixture', caption='Old caption')
         with patch('card_delivery.prepare', side_effect=prepare_fixture):
             complete = await deliver(message, result, 'fixture', 'separate',
                                      redelivery=Redelivery('separate', (), record))
             self.assertFalse(complete)
             self.assertEqual(receipts, ['card'])
+            message.answer.assert_not_awaited()
+            self.assertEqual(message.answer_document.await_args_list[0].kwargs['caption'],
+                             'Проблема со скачиванием исправлена. Вот ваш персонаж: ')
             message.answer_document = AsyncMock()
             complete = await deliver(message, result, 'fixture', 'separate',
                                      redelivery=Redelivery('separate', tuple(receipts), record))

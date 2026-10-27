@@ -37,7 +37,7 @@ async def deliver(message, result, identifier, mode, *, redelivery=None):
             caption = (caption + '\n' if caption else '') + notice
         sent_keys = set(redelivery.sent_keys) if redelivery else set()
         if redelivery:
-            caption = (caption + '\n' if caption else '') + redelivery.notice
+            caption = redelivery.notice
         if 'card' not in sent_keys:
             await message.answer_document(FSInputFile(card), caption=caption)
             if redelivery:
@@ -63,7 +63,7 @@ async def deliver(message, result, identifier, mode, *, redelivery=None):
                         await asyncio.sleep(exc.retry_after)
             except TelegramAPIError:
                 failed += 1
-        if failed:
+        if failed and redelivery is None:
             await message.answer(f'Карточка отправлена, но не удалось отправить JSON-файлы лорбуков: {failed}.')
         trace.emit('sent', operation='telegram_send', books=len(books)-failed, missing=missing+failed)
         return failed == 0

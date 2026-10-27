@@ -43,21 +43,27 @@ class AlertRetryStore:
                 expires_at TIMESTAMPTZ NOT NULL DEFAULT now() + interval '30 days'
             )''')
             db.execute('CREATE INDEX IF NOT EXISTS idx_card_alert_expiry ON card_alert_retries (expires_at)')
+            db.execute("ALTER TABLE card_alert_retries ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT ''")
+            db.execute("ALTER TABLE card_alert_retries ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT ''")
+            db.execute("ALTER TABLE card_alert_retries ADD COLUMN IF NOT EXISTS alert_text TEXT NOT NULL DEFAULT ''")
 
     def _connect(self):
         return psycopg.connect(self._url, autocommit=True, row_factory=dict_row, connect_timeout=10,
                                options='-c statement_timeout=15000 -c lock_timeout=5000')
 
-    def create(self, *, user_id, chat_id, chat_type, url, lorebook_mode, bot_id, admin_chat_id):
+    def create(self, *, user_id, chat_id, chat_type, url, lorebook_mode, bot_id, admin_chat_id,
+               username='', full_name='', alert_text=''):
         if user_id <= 0 or len(url) > 4096 or lorebook_mode not in ('separate', 'embedded', 'both'):
             raise ValueError('Invalid alert retry')
         token = token_urlsafe(18)
         with self._connect() as db:
             db.execute('DELETE FROM card_alert_retries WHERE expires_at <= now()')
             db.execute('''INSERT INTO card_alert_retries
-                (token, user_id, chat_id, chat_type, url, lorebook_mode, bot_id, admin_chat_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
-                (token, user_id, chat_id, chat_type, url, lorebook_mode, bot_id, admin_chat_id))
+                (token, user_id, chat_id, chat_type, url, lorebook_mode, bot_id, admin_chat_id,
+                 username, full_name, alert_text)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                (token, user_id, chat_id, chat_type, url, lorebook_mode, bot_id, admin_chat_id,
+                 username, full_name, alert_text))
         return token
 
     def bind_message(self, token, message_id):

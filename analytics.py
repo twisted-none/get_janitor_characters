@@ -56,6 +56,11 @@ class AnalyticsStore:
                 (user.id, user.username or "", user.full_name or "", started, started),
             )
 
+    def get_user_identity(self, user_id: int) -> dict | None:
+        with self.lock, self._connect() as db:
+            return db.execute('SELECT username, full_name FROM bot_users WHERE user_id = %s',
+                              (user_id,)).fetchone()
+
     def start_download(self, user_id: int, character_id: str, url: str) -> int:
         with self.lock, self._connect() as db:
             row = db.execute(

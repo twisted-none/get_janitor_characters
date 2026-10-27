@@ -37,6 +37,7 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.queue_msg = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock(), message_id=11)
         self.wait_msg = self.queue_msg
         self.message = SimpleNamespace(
+            message_id=0, edit_text=AsyncMock(), delete=AsyncMock(),
             text="https://janitorai.com/characters/abc", from_user=SimpleNamespace(id=7),
             chat=SimpleNamespace(id=10),
             answer=AsyncMock(return_value=self.wait_msg), answer_document=AsyncMock(),
@@ -80,6 +81,8 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
                                'jannyai': SourceError(janny).to_payload()})
 
     async def test_both_missing_schedule_without_holding_queue_and_can_be_cancelled(self):
+        self.message.from_user.username = 'original_tag'
+        self.message.from_user.full_name = 'Имя Фамилия'
         self.scope['parser'] = SimpleNamespace(download_card=AsyncMock(side_effect=self.missing_error()))
         store = SimpleNamespace(schedule=Mock(return_value=True), cancel=Mock(return_value=True), finish=Mock())
         with self.assertLogs(level='INFO') as logs:
@@ -89,6 +92,7 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.scope['download_jobs'])
         request = store.schedule.call_args.args[0]
         self.assertEqual(request['completed_attempts'], 1)
+        self.assertEqual((request['username'], request['full_name']), ('original_tag', 'Имя Фамилия'))
         self.assertIn('30 минут', self.wait_msg.edit_text.await_args.args[0])
         self.scope['_notify_admin'].assert_not_awaited()
         callback = SimpleNamespace(data='download:cancel:' + request['token'], from_user=self.message.from_user,
@@ -105,6 +109,25 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
         store.schedule.assert_not_called()
         self.assertNotIn('30 минут', self.wait_msg.edit_text.await_args.args[0])
 
+    async def test_admin_redelivery_success_has_no_status_messages(self):
+        self.configure_download(DownloadSource.JANNYAI)
+        self.scope['deliver'] = AsyncMock(return_value=True)
+        result = await self.scope['handle_link'](self.message, None, redelivery=SimpleNamespace(mode='both'))
+        self.assertTrue(result)
+        self.message.answer.assert_not_awaited()
+        self.message.edit_text.assert_not_awaited()
+        self.message.delete.assert_not_awaited()
+        self.wait_msg.delete.assert_not_awaited()
+
+    async def test_admin_redelivery_timeout_is_silent_and_does_not_alert(self):
+        self.scope['parser'] = SimpleNamespace(download_card=AsyncMock(side_effect=TimeoutError()))
+        result = await self.scope['handle_link'](self.message, None, redelivery=SimpleNamespace(mode='both'))
+        self.assertFalse(result)
+        self.message.answer.assert_not_awaited()
+        self.message.edit_text.assert_not_awaited()
+        self.wait_msg.edit_text.assert_not_awaited()
+        self.scope['_notify_admin'].assert_not_awaited()
+
     async def test_admin_redelivery_failure_does_not_create_new_alert_or_delayed_job(self):
         self.scope['parser'] = SimpleNamespace(download_card=AsyncMock(side_effect=self.missing_error()))
         store = SimpleNamespace(schedule=Mock(), finish=Mock())
@@ -112,6 +135,9 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
                                        redelivery=SimpleNamespace(mode='both'))
         self.scope['_notify_admin'].assert_not_awaited()
         store.schedule.assert_not_called()
+        self.message.answer.assert_not_awaited()
+        self.message.edit_text.assert_not_awaited()
+        self.wait_msg.edit_text.assert_not_awaited()
 
     async def test_database_failure_does_not_promise_a_retry(self):
         self.scope['parser'] = SimpleNamespace(download_card=AsyncMock(side_effect=self.missing_error()))

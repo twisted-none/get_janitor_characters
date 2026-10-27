@@ -70,7 +70,7 @@ class RetryStorageTests(unittest.TestCase):
             db.execute('TRUNCATE pending_card_retries')
         self.request = dict(token='a' * 24, user_id=7, chat_id=10, message_id=11, chat_type='private',
                             character_id='fixture', url='https://janitorai.com/characters/fixture',
-                            title='Тест', completed_attempts=1)
+                            title='Тест', completed_attempts=1, username='saved_tag', full_name='Имя Фамилия')
 
     def make_due(self):
         with self.store._connect() as db:
@@ -86,6 +86,7 @@ class RetryStorageTests(unittest.TestCase):
         self.make_due()
         request = self.store.claim_due()
         self.assertEqual(request['completed_attempts'], 1)
+        self.assertEqual((request['username'], request['full_name']), ('saved_tag', 'Имя Фамилия'))
         self.assertIsNone(self.store.claim_due())
         restarted = RetryStore(self.url)
         restarted.recover_running()
@@ -108,6 +109,16 @@ class RetryStorageTests(unittest.TestCase):
         self.assertTrue(self.store.cancel(self.request['token'], 7, 10, 11))
         self.assertFalse(self.store.schedule(self.request, resumed=True))
         self.assertFalse(self.store.exists(self.request['token']))
+
+    def test_upgrade_existing_table_keeps_pending_request(self):
+        self.store.schedule(self.request)
+        with self.store._connect() as db:
+            db.execute('ALTER TABLE pending_card_retries DROP COLUMN username, DROP COLUMN full_name')
+        upgraded = RetryStore(self.url)
+        self.make_due()
+        request = upgraded.claim_due()
+        self.assertEqual(request['token'], self.request['token'])
+        self.assertEqual((request['username'], request['full_name']), ('', ''))
 
     def test_third_completed_attempt_cannot_be_scheduled(self):
         self.request['completed_attempts'] = 3
