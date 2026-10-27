@@ -8,9 +8,40 @@ from unittest.mock import AsyncMock
 
 from PIL import Image, PngImagePlugin
 from card_delivery import deliver
+from alert_redelivery import Redelivery
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_redelivery_records_each_file_and_skips_successful_card_on_retry(self):
+        from aiogram.exceptions import TelegramBadRequest
+        from aiogram.methods import SendDocument
+        from unittest.mock import patch
+        receipts = []
+
+        async def record(key):
+            receipts.append(key)
+
+        def prepare_fixture(source, directory, identifier, mode):
+            card, book = Path(directory) / 'card.png', Path(directory) / 'book.json'
+            card.write_bytes(b'fixture')
+            book.write_text('{"name":"Lore","entries":[]}', encoding='utf-8')
+            return card, [book], 0
+
+        error = TelegramBadRequest(method=SendDocument(chat_id=1, document='fixture'), message='fixture failure')
+        message = SimpleNamespace(answer_document=AsyncMock(side_effect=[None, error]), answer=AsyncMock())
+        result = SimpleNamespace(file_path='fixture', caption=None)
+        with patch('card_delivery.prepare', side_effect=prepare_fixture):
+            complete = await deliver(message, result, 'fixture', 'separate',
+                                     redelivery=Redelivery('separate', (), record))
+            self.assertFalse(complete)
+            self.assertEqual(receipts, ['card'])
+            message.answer_document = AsyncMock()
+            complete = await deliver(message, result, 'fixture', 'separate',
+                                     redelivery=Redelivery('separate', tuple(receipts), record))
+            self.assertTrue(complete)
+            message.answer_document.assert_awaited_once()
+            self.assertTrue(receipts[-1].startswith('book:'))
+
     async def test_json_send_failure_keeps_delivered_card_and_cleans_files(self):
         from aiogram.exceptions import TelegramBadRequest
         from aiogram.methods import SendDocument

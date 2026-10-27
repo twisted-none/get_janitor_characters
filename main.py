@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sys
+from datetime import UTC, datetime
 from secrets import token_hex
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -68,6 +69,9 @@ import parser
 from download_flow import DownloadFailed, remove_download
 from download_status import DownloadStatus, DownloadJob, card_label, queue_status
 from download_queue import DownloadQueue, QueueFull
+from download_retries import RetryStore, run_retries, waiting_text, EXHAUSTED_TEXT, MAX_ATTEMPTS
+from alert_retries import AlertRetryStore
+from alert_redelivery import AlertRedelivery, PREFIX as ALERT_RETRY_PREFIX, start_alert_server
 from analytics import AnalyticsStore
 from metrics import run_metrics_server
 from card_delivery import deliver
@@ -326,11 +330,32 @@ async def handle_broadcast_confirm(callback: CallbackQuery, analytics_store: Ana
                          reply_markup=_main_keyboard(callback.from_user.id))
 
 
+@dp.callback_query(F.data.startswith(ALERT_RETRY_PREFIX))
+async def handle_alert_retry(callback: CallbackQuery, alert_service: AlertRedelivery) -> None:
+    if callback.message is None:
+        await callback.answer('Сообщение недоступно.', show_alert=True)
+        return
+    text = await alert_service.submit(dict(token=(callback.data or '').removeprefix(ALERT_RETRY_PREFIX),
+        user_id=callback.from_user.id, chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id, bot_id=callback.bot.id))
+    await callback.answer(text, show_alert=True)
+
+
 @dp.callback_query(F.data.startswith('download:cancel:'))
-async def handle_cancel_download(callback: CallbackQuery) -> None:
+async def handle_cancel_download(callback: CallbackQuery, retry_store: RetryStore | None = None) -> None:
     token = (callback.data or '').removeprefix('download:cancel:')
     job = download_jobs.get(token)
     message = callback.message
+    if job is None and message is not None and retry_store is not None:
+        cancelled = await asyncio.to_thread(retry_store.cancel, token, callback.from_user.id,
+                                            message.chat.id, message.message_id)
+        if cancelled:
+            await callback.answer('Отложенные проверки отменены.')
+            try:
+                await message.edit_text('Загрузка отменена.', reply_markup=None, parse_mode=None)
+            except TelegramAPIError:
+                logging.warning('Не удалось показать отмену отложенной проверки')
+            return
     if (job is None or message is None or job.user_id != callback.from_user.id
             or job.chat_id != message.chat.id or job.message_id != message.message_id
             or job.task.done()):
@@ -347,7 +372,9 @@ async def handle_cancel_download(callback: CallbackQuery) -> None:
 
 @dp.message(F.text.regexp(CHARACTER_URL_RE))
 @trace.job
-async def handle_link(message: types.Message, analytics_store: AnalyticsStore) -> None:
+async def handle_link(message: types.Message, analytics_store: AnalyticsStore,
+                      retry_store: RetryStore | None = None, retry_request: dict | None = None,
+                      alert_service: AlertRedelivery | None = None, redelivery=None) -> bool | None:
     match = re.search(CHARACTER_URL_RE, message.text or "")
     if not match:
         return
@@ -356,13 +383,13 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore) -
     character_id = match.group("id")
     trace.emit('received', character_id=character_id)
     character_url = match.group(0).strip()
-    token = token_hex(12)
+    token = retry_request['token'] if retry_request else token_hex(12)
     markup = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text='Отменить загрузку', callback_data=f'download:cancel:{token}'),
     ]])
-    label = card_label(character_url, character_id)
+    label = retry_request['title'] if retry_request else card_label(character_url, character_id)
     initial_text = f'Карточка: {label}\n{queue_status()}'
-    wait_msg = await message.answer(initial_text, reply_markup=markup, parse_mode=None)
+    wait_msg = message if retry_request else await message.answer(initial_text, reply_markup=markup, parse_mode=None)
     status_message = wait_msg
 
     async def edit_status(text):
@@ -374,11 +401,17 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore) -
     download_id = None
     job = DownloadJob(user_id, message.chat.id, wait_msg.message_id, asyncio.current_task())
     download_jobs[token] = job
+    attempt = retry_request['completed_attempts'] + 1 if retry_request else 1
+    deferred = False
     job_id = id(wait_msg)
     pending_downloads.add(job_id)
     logging.info("Получена ссылка от user_id=%s, source=%s, character_id=%s", user_id, source, character_id)
 
     try:
+        if retry_request:
+            if not await asyncio.to_thread(retry_store.exists, token):
+                return  # A pending cancellation won the race with scheduler dispatch.
+            await edit_status(initial_text)
         download_id = await _start_download(analytics_store, user_id, character_id, character_url)
         async with download_queue.slot(user_id, on_queued=status.queued):
             logging.info(
@@ -399,35 +432,71 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore) -
             file_path = result.file_path
             logging.info("Файл готов: %s, размер=%s байт", file_path, os.path.getsize(file_path))
             job.sending = True
+            if retry_request:
+                # Telegram cannot provide exactly-once sends across a process crash.
+                # Remove the durable retry before sending to avoid duplicate delivery on restart.
+                await asyncio.to_thread(retry_store.finish, token)
             await status.sending()
-            mode = await asyncio.to_thread(analytics_store.get_lorebook_mode, user_id)
-            await deliver(message, result, character_id, mode)
+            mode = redelivery.mode if redelivery else await asyncio.to_thread(analytics_store.get_lorebook_mode, user_id)
+            if redelivery:
+                delivered = await deliver(message, result, character_id, mode, redelivery=redelivery)
+            else:
+                delivered = await deliver(message, result, character_id, mode)
         await _finish_download(analytics_store, download_id, success=True)
         try:
             await status_message.delete()
         except TelegramAPIError:
             logging.warning("Не удалось удалить сообщение статуса после отправки карточки")
+        return delivered is not False if redelivery else True
     except asyncio.CancelledError:
         if not job.cancel_requested:
             raise
-        await status.close()
         await _finish_download(analytics_store, download_id, success=False, error='cancelled by user')
-        try:
-            await status_message.edit_text('Загрузка отменена.', reply_markup=None, parse_mode=None)
-        except TelegramAPIError:
-            logging.warning('Не удалось показать отмену скачивания')
     except asyncio.TimeoutError:
         logging.exception("Таймаут скачивания персонажа %s", character_id)
         await _finish_download(analytics_store, download_id, success=False, error="download timeout")
-        await _notify_admin(message, character_url, TimeoutError("download timeout"))
+        if redelivery is None:
+            await _notify_admin(message, character_url, TimeoutError("download timeout"), alert_service=alert_service)
         await status_message.edit_text(
             "Скачивание заняло слишком много времени. Попробуй позже или напиши в поддержку через /help.",
             reply_markup=_support_keyboard(),
         )
     except Exception as e:
-        logging.exception("Ошибка скачивания персонажа %s", character_id)
+        missing = isinstance(e, DownloadFailed) and e.missing_from_mirrors
+        if missing:
+            logging.info('Карточка отсутствует на обоих зеркалах: character_id=%s attempt=%s', character_id, attempt)
+        else:
+            logging.exception("Ошибка скачивания персонажа %s", character_id)
         await _finish_download(analytics_store, download_id, success=False, error=str(e))
-        await _notify_admin(message, character_url, e)
+        if missing and redelivery is None:
+            if attempt >= MAX_ATTEMPTS:
+                await status.close()
+                await status_message.edit_text(f'Карточка: {status.title}\n{EXHAUSTED_TEXT}',
+                                               reply_markup=None, parse_mode=None)
+                return
+            if retry_store is not None:
+                request = dict(token=token, user_id=user_id, chat_id=message.chat.id,
+                               message_id=wait_msg.message_id, chat_type=getattr(message.chat, 'type', 'private'),
+                               character_id=character_id, url=character_url, title=status.title,
+                               completed_attempts=attempt)
+                try:
+                    deferred = await asyncio.to_thread(retry_store.schedule, request, resumed=bool(retry_request))
+                except Exception as error:
+                    logging.warning('Cannot save card retry: %s', type(error).__name__)
+                if deferred:
+                    await status.close()
+                    notice = f'Карточка: {status.title}\n{waiting_text(attempt)}'
+                    try:
+                        await edit_status(notice)
+                    except TelegramAPIError:
+                        # The persisted request must remain valid even if Telegram refuses an edit.
+                        try:
+                            await message.answer(notice, parse_mode=None)
+                        except TelegramAPIError:
+                            logging.warning('Cannot show deferred retry notice')
+                    return
+        if redelivery is None:
+            await _notify_admin(message, character_url, e, alert_service=alert_service)
         error_text = (str(e) if isinstance(e, (DownloadFailed, QueueFull)) else
                       "Не удалось скачать персонажа. Проверь, что страница доступна, и попробуй снова.")
         await status_message.edit_text(error_text + " Если ошибка повторяется, напиши в поддержку через /help.",
@@ -435,6 +504,18 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore) -
     finally:
         if status is not None:
             await status.close()
+        # Keep interrupted retries for recovery; explicit cancellation is final.
+        interrupted = asyncio.current_task().cancelling() and not job.cancel_requested
+        if retry_store is not None and (job.cancel_requested or (retry_request and not deferred and not interrupted)):
+            try:
+                await asyncio.to_thread(retry_store.finish, token)
+            except Exception as error:
+                logging.warning('Cannot finish card retry: %s', type(error).__name__)
+        if job.cancel_requested:
+            try:
+                await status_message.edit_text('Загрузка отменена.', reply_markup=None, parse_mode=None)
+            except TelegramAPIError:
+                logging.warning('Не удалось показать отмену скачивания')
         if file_path:
             remove_download(file_path)
         pending_downloads.discard(job_id)
@@ -453,14 +534,44 @@ async def handle_invalid_input(message: types.Message) -> None:
 
 async def main() -> None:
     analytics_store = AnalyticsStore(DATABASE_URL)
+    retry_store = await asyncio.to_thread(RetryStore, DATABASE_URL)
+    alert_store = await asyncio.to_thread(AlertRetryStore, DATABASE_URL)
     dp["analytics_store"] = analytics_store
+    dp['retry_store'] = retry_store
     dp.message.middleware(RegisterUserMiddleware())
     metrics_task = asyncio.create_task(run_metrics_server(analytics_store, METRICS_HOST, METRICS_PORT))
+    retry_task = None
+    alert_runner = None
+
+    async def redownload(message, context):
+        return await handle_link(message, analytics_store, retry_store=retry_store,
+                                 alert_service=alert_service, redelivery=context)
+
+    alert_service = AlertRedelivery(bot, alert_bot or bot, ADMIN_CHAT_ID, alert_store,
+                                    redownload, analytics_store)
+    dp['alert_service'] = alert_service
+
+    async def resume(request):
+        message = types.Message(message_id=request['message_id'], date=datetime.now(UTC), text=request['url'],
+                                chat=types.Chat(id=request['chat_id'], type=request['chat_type']),
+                                from_user=types.User(id=request['user_id'], is_bot=False,
+                                                     first_name='Пользователь')).as_(bot)
+        await handle_link(message, analytics_store, retry_store=retry_store, retry_request=request,
+                          alert_service=alert_service)
+
     try:
         await _setup_commands()
+        alert_runner = await start_alert_server(alert_service, ALERT_BOT_TOKEN or TOKEN)
+        retry_task = asyncio.create_task(run_retries(retry_store, resume))
         await dp.start_polling(bot, tasks_concurrency_limit=1024)
     finally:
         metrics_task.cancel()
+        if retry_task is not None:
+            retry_task.cancel()
+            await asyncio.gather(retry_task, return_exceptions=True)
+        if alert_runner is not None:
+            await alert_runner.cleanup()
+        await alert_service.close()
         if alert_bot:
             await alert_bot.session.close()
 
@@ -581,7 +692,7 @@ async def _send_support_message(message: types.Message, text: str) -> None:
     await message.answer("Сообщение отправлено. Я пришлю ответ здесь.", reply_markup=_main_keyboard(user.id))
 
 
-async def _notify_admin(message: types.Message, url: str, error: Exception) -> None:
+async def _notify_admin(message: types.Message, url: str, error: Exception, *, alert_service=None) -> None:
     if not ADMIN_CHAT_ID:
         return
     user = message.from_user
@@ -604,7 +715,10 @@ async def _notify_admin(message: types.Message, url: str, error: Exception) -> N
             if diagnostic["exit_code"] is not None:
                 text += f" [exit {diagnostic['exit_code']}]"
     try:
-        await (alert_bot or message.bot).send_message(ADMIN_CHAT_ID, text)
+        if alert_service is not None:
+            await alert_service.notify(message, url, text)
+        else:
+            await (alert_bot or message.bot).send_message(ADMIN_CHAT_ID, text)
     except Exception:
         logging.exception("Failed to notify admin about user error")
 

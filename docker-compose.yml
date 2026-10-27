@@ -31,3 +31,11 @@ services:
       - /tmp:rw,nosuid,size=256m,mode=1777
     volumes:
       - /srv/projects/data/get_janitor_characters_bot/cache:/app/.cache
+    networks:
+      - default
+      - bot-alerts
+
+networks:
+  bot-alerts:
+    name: bot-alerts
+    external: true

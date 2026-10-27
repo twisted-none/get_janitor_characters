@@ -94,6 +94,10 @@ class DownloadStatus:
         self._waiting = False
         self._lock = asyncio.Lock()
 
+    @property
+    def title(self) -> str:
+        return self._title
+
     async def __call__(self, event: DownloadSource | DownloadProgress) -> None:
         if isinstance(event, DownloadProgress) and clean_title(event.title):
             self._title = clean_title(event.title)

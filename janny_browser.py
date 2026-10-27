@@ -13,6 +13,14 @@ from janny_transport import allowed_url, native_transport
 BINARY = '/opt/camoufox/camoufox-bin'
 
 
+def document_status(response, page, url):
+    """Only the requested top-level document can confirm that a card is absent."""
+    if (response.frame == page.main_frame and response.request.is_navigation_request()
+            and response.url.split('?', 1)[0].rstrip('/') == url):
+        return response.status
+    return None
+
+
 def _checkbox(page):
     from Xlib import X, display
     from Xlib.ext import xtest
@@ -79,12 +87,25 @@ def read_page(identifier):
         context.route('**/*', route)
         context.route_web_socket('**/*', lambda socket: socket.close())
         page = context.new_page()
-        page.goto(url, wait_until='domcontentloaded', timeout=45_000)
+        last_status = None
+
+        def observe_document(response):
+            nonlocal last_status
+            status = document_status(response, page, url)
+            if status is not None:
+                last_status = status
+
+        page.on('response', observe_document)
+        response = page.goto(url, wait_until='domcontentloaded', timeout=45_000)
+        if response is not None:
+            observe_document(response)
         deadline = time.monotonic() + 65
         next_click = time.monotonic() + 8
         while time.monotonic() < deadline:
             if not allowed_url(page.url) or not page.url.startswith('https://jannyai.com/characters/'):
                 raise SourceError('unsafe_url')
+            if last_status == 404:
+                raise SourceError('not_found', http_status=404)
             island = page.locator('astro-island[component-url*="CharacterButtons"][props]')
             if island.count():
                 props = island.first.get_attribute('props') or ''

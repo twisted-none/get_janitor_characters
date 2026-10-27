@@ -7,13 +7,15 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from secrets import token_hex
 
 from download_flow import DownloadFailed, DownloadResult, DownloadSource, DownloadProgress, DownloadPhase, remove_download
 from download_status import DownloadStatus, DownloadJob, card_label, active_status, queue_status
 from download_queue import DownloadQueue, QueueFull
 import download_trace as trace
+from download_errors import SourceError
+from download_retries import MAX_ATTEMPTS, waiting_text, EXHAUSTED_TEXT
 
 
 class FakeTelegramError(Exception):
@@ -40,6 +42,7 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
             answer=AsyncMock(return_value=self.wait_msg), answer_document=AsyncMock(),
         )
         self.scope = {
+            'MAX_ATTEMPTS': MAX_ATTEMPTS, 'waiting_text': waiting_text, 'EXHAUSTED_TEXT': EXHAUSTED_TEXT,
             'download_jobs': {}, 'DownloadJob': DownloadJob, 'card_label': card_label,
             'token_hex': token_hex,
             'InlineKeyboardMarkup': lambda **kwargs: kwargs,
@@ -68,9 +71,111 @@ class DownloadHandlerTests(unittest.IsolatedAsyncioTestCase):
             ast.Module(body=[callback], type_ignores=[])), 'main.py', 'exec'), self.scope)
         original = self.scope['handle_link']
         self.preferences = SimpleNamespace(get_lorebook_mode=lambda _: 'separate')
-        async def with_preferences(message, store):
-            await original(message, store or self.preferences)
+        async def with_preferences(message, store, **kwargs):
+            return await original(message, store or self.preferences, **kwargs)
         self.scope['handle_link'] = with_preferences
+
+    def missing_error(self, janny='not_found'):
+        return DownloadFailed({'datacat': SourceError('not_found').to_payload(),
+                               'jannyai': SourceError(janny).to_payload()})
+
+    async def test_both_missing_schedule_without_holding_queue_and_can_be_cancelled(self):
+        self.scope['parser'] = SimpleNamespace(download_card=AsyncMock(side_effect=self.missing_error()))
+        store = SimpleNamespace(schedule=Mock(return_value=True), cancel=Mock(return_value=True), finish=Mock())
+        with self.assertLogs(level='INFO') as logs:
+            await self.scope['handle_link'](self.message, None, retry_store=store)
+        self.assertNotIn('ERROR:', '\n'.join(logs.output))
+        self.assertEqual(self.scope['download_queue']._active, 0)
+        self.assertFalse(self.scope['download_jobs'])
+        request = store.schedule.call_args.args[0]
+        self.assertEqual(request['completed_attempts'], 1)
+        self.assertIn('30 минут', self.wait_msg.edit_text.await_args.args[0])
+        self.scope['_notify_admin'].assert_not_awaited()
+        callback = SimpleNamespace(data='download:cancel:' + request['token'], from_user=self.message.from_user,
+                                   message=SimpleNamespace(chat=self.message.chat, message_id=11,
+                                                           edit_text=AsyncMock()), answer=AsyncMock())
+        await self.scope['handle_cancel_download'](callback, retry_store=store)
+        store.cancel.assert_called_once_with(request['token'], 7, 10, 11)
+        self.assertIn('отменена', callback.message.edit_text.await_args.args[0])
+
+    async def test_cloudflare_does_not_claim_card_is_absent(self):
+        self.scope['parser'] = SimpleNamespace(download_card=AsyncMock(side_effect=self.missing_error('challenge_required')))
+        store = SimpleNamespace(schedule=Mock(), finish=Mock())
+        await self.scope['handle_link'](self.message, None, retry_store=store)
+        store.schedule.assert_not_called()
+        self.assertNotIn('30 минут', self.wait_msg.edit_text.await_args.args[0])
+
+    async def test_admin_redelivery_failure_does_not_create_new_alert_or_delayed_job(self):
+        self.scope['parser'] = SimpleNamespace(download_card=AsyncMock(side_effect=self.missing_error()))
+        store = SimpleNamespace(schedule=Mock(), finish=Mock())
+        await self.scope['handle_link'](self.message, None, retry_store=store,
+                                       redelivery=SimpleNamespace(mode='both'))
+        self.scope['_notify_admin'].assert_not_awaited()
+        store.schedule.assert_not_called()
+
+    async def test_database_failure_does_not_promise_a_retry(self):
+        self.scope['parser'] = SimpleNamespace(download_card=AsyncMock(side_effect=self.missing_error()))
+        store = SimpleNamespace(schedule=Mock(side_effect=RuntimeError('fixture')), finish=Mock())
+        await self.scope['handle_link'](self.message, None, retry_store=store)
+        self.assertNotIn('Проверю снова', self.wait_msg.edit_text.await_args.args[0])
+        self.scope['_notify_admin'].assert_awaited_once()
+
+    async def test_successful_retry_removes_schedule_before_delivery(self):
+        self.configure_download(DownloadSource.JANNYAI)
+        store = SimpleNamespace(exists=Mock(return_value=True), finish=Mock())
+        self.message.message_id = 11
+        self.message.edit_text = self.wait_msg.edit_text
+        self.message.delete = self.wait_msg.delete
+
+        async def deliver(*args):
+            store.finish.assert_called_once_with('saved-token')
+
+        self.scope['deliver'] = deliver
+        await self.scope['handle_link'](self.message, None, retry_store=store,
+                                       retry_request=dict(token='saved-token', title='Saved title', completed_attempts=1))
+        self.message.answer.assert_not_awaited()
+        self.assertFalse(self.path.exists())
+
+    async def test_shutdown_keeps_in_progress_retry_for_restart(self):
+        entered = asyncio.Event()
+
+        async def download(*args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        self.scope['parser'] = SimpleNamespace(download_card=download)
+        store = SimpleNamespace(exists=Mock(return_value=True), finish=Mock())
+        self.message.message_id = 11
+        self.message.edit_text = self.wait_msg.edit_text
+        task = asyncio.create_task(self.scope['handle_link'](
+            self.message, None, retry_store=store,
+            retry_request=dict(token='saved-token', title='Saved title', completed_attempts=1)))
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        store.finish.assert_not_called()
+        self.assertEqual(self.scope['download_queue']._active, 0)
+
+    async def test_only_two_additional_attempts_and_terminal_missing_message(self):
+        for completed in (1, 2):
+            with self.subTest(completed=completed):
+                self.scope['parser'] = SimpleNamespace(download_card=AsyncMock(side_effect=self.missing_error()))
+                store = SimpleNamespace(schedule=Mock(return_value=True), exists=Mock(return_value=True), finish=Mock())
+                self.message.message_id = 11
+                self.message.edit_text = self.wait_msg.edit_text
+                self.message.delete = self.wait_msg.delete
+                request = dict(token='saved-token', title='Saved title', completed_attempts=completed)
+                await self.scope['handle_link'](self.message, None, retry_store=store, retry_request=request)
+                if completed == 1:
+                    self.assertEqual(store.schedule.call_args.args[0]['completed_attempts'], 2)
+                    self.assertTrue(store.schedule.call_args.kwargs['resumed'])
+                    self.assertIn('Повтор 2 из 2', self.wait_msg.edit_text.await_args.args[0])
+                else:
+                    store.schedule.assert_not_called()
+                    store.finish.assert_called_once_with('saved-token')
+                    self.assertIn('автоматические попытки завершены', self.wait_msg.edit_text.await_args.args[0])
+                self.assertIn('Saved title', self.wait_msg.edit_text.await_args.args[0])
 
     async def test_cancel_active_download_cleans_worker_before_releasing_slot(self):
         started, stopping, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()

@@ -49,6 +49,11 @@ class DownloadFailed(ValueError):
                             if source in {stage.value for stage in DownloadSource}}
         super().__init__("Не удалось получить карточку через DataCat, JannyAI и JanitorAI.")
 
+    @property
+    def missing_from_mirrors(self) -> bool:
+        return all(self.diagnostics.get(source, {}).get('code') == 'not_found'
+                   for source in ('datacat', 'jannyai'))
+
 
 @dataclass(frozen=True)
 class Candidate:

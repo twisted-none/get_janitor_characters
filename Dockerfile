@@ -55,6 +55,8 @@ COPY main.py analytics.py metrics.py parser.py browser_runtime.py janitor_proxy.
 COPY janny_public.py janny_browser.py janny_transport.py ./
 COPY tools/preflight.py tools/db_backup.py tools/browser_smoke.py tools/database_smoke.py ./tools/
 COPY download_trace.py lorebooks.py card_delivery.py ./
+COPY download_retries.py ./
+COPY alert_retries.py alert_redelivery.py ./
 RUN useradd --create-home --uid 10001 bot \
     && mkdir -p /app/.cache \
     && chown -R bot:bot /app/.cache /home/bot
