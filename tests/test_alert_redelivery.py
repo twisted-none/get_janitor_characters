@@ -13,6 +13,28 @@ from alert_retries import AlertRetryStore
 
 
 class RedeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_handled_failure_and_success_are_logged_without_private_payloads(self):
+        async def failed(message, context):
+            context.failure = 'Источник не отдал карточку.'
+            context.error = ValueError('private response body')
+            return False
+        self.download.side_effect = failed
+        with self.assertLogs('alert_redelivery', level='INFO') as output:
+            await self.service.submit(self.payload)
+            await self.drain()
+        text = '\n'.join(output.output)
+        self.assertIn('alert_retry_started', text)
+        self.assertIn('alert_retry_failed', text)
+        self.assertIn('Источник не отдал карточку', text)
+        self.assertNotIn('private response body', text)
+        self.assertNotIn(self.payload['token'], text)
+        self.download.side_effect = None
+        self.download.return_value = True
+        with self.assertLogs('alert_redelivery', level='INFO') as output:
+            await self.service.submit(self.payload)
+            await self.drain()
+        self.assertIn('alert_retry_succeeded', '\n'.join(output.output))
+
     async def asyncSetUp(self):
         self.main_bot = Bot('111111:fake_test_token')
         self.addAsyncCleanup(self.main_bot.session.close)
@@ -115,6 +137,15 @@ class RedeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.store.claim.return_value = None
         await self.service.submit(self.payload)
         self.assertFalse(self.service.active)
+
+    async def test_claim_failure_is_logged_without_payload_and_releases_slot(self):
+        self.store.claim.side_effect = RuntimeError('secret database response')
+        with self.assertLogs('alert_redelivery', level='INFO') as output:
+            text = await self.service.submit(self.payload)
+        self.assertIn('Не удалось начать', text)
+        self.assertFalse(self.service.active)
+        self.assertIn('alert_retry_failed', '\n'.join(output.output))
+        self.assertNotIn('secret database response', '\n'.join(output.output))
 
     async def test_alert_button_is_attached_only_after_database_binding(self):
         self.store.create = Mock(return_value='a' * 24)

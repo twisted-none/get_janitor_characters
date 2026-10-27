@@ -61,8 +61,11 @@ async def deliver(message, result, identifier, mode, *, redelivery=None):
                         if attempt == 2 or exc.retry_after > 120:
                             raise
                         await asyncio.sleep(exc.retry_after)
-            except TelegramAPIError:
+            except TelegramAPIError as error:
                 failed += 1
+                if redelivery is not None:
+                    redelivery.failure = 'Telegram не доставил часть файлов лорбуков.'
+                    redelivery.error = error
         if failed and redelivery is None:
             await message.answer(f'Карточка отправлена, но не удалось отправить JSON-файлы лорбуков: {failed}.')
         trace.emit('sent', operation='telegram_send', books=len(books)-failed, missing=missing+failed)

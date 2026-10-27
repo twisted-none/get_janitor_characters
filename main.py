@@ -455,8 +455,12 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore,
         if not job.cancel_requested:
             raise
         await _finish_download(analytics_store, download_id, success=False, error='cancelled by user')
-    except asyncio.TimeoutError:
-        logging.exception("Таймаут скачивания персонажа %s", character_id)
+    except asyncio.TimeoutError as error:
+        if redelivery is None:
+            logging.exception("Таймаут скачивания персонажа %s", character_id)
+        else:
+            redelivery.failure = 'Скачивание персонажа превысило время ожидания.'
+            redelivery.error = error
         await _finish_download(analytics_store, download_id, success=False, error="download timeout")
         if redelivery is None:
             await _notify_admin(message, character_url, TimeoutError("download timeout"), alert_service=alert_service)
@@ -470,8 +474,11 @@ async def handle_link(message: types.Message, analytics_store: AnalyticsStore,
         missing = isinstance(e, DownloadFailed) and e.missing_from_mirrors
         if missing:
             logging.info('Карточка отсутствует на обоих зеркалах: character_id=%s attempt=%s', character_id, attempt)
-        else:
+        elif redelivery is None:
             logging.exception("Ошибка скачивания персонажа %s", character_id)
+        if redelivery is not None:
+            redelivery.failure = str(e) if isinstance(e, (DownloadFailed, QueueFull)) else 'Не удалось скачать или отправить персонажа.'
+            redelivery.error = e
         await _finish_download(analytics_store, download_id, success=False, error=str(e))
         if missing and redelivery is None:
             if attempt >= MAX_ATTEMPTS:

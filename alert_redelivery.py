@@ -10,6 +10,11 @@ import json
 import logging
 import re
 import time
+from uuid import uuid4
+
+from retry_logging import log_retry
+
+logger = logging.getLogger(__name__)
 
 from aiohttp import web
 from aiogram.types import Chat, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
@@ -40,12 +45,14 @@ def keyboard(token, *, busy=False):
         callback_data=PREFIX + token)]])
 
 
-@dataclass(frozen=True)
+@dataclass
 class Redelivery:
     mode: str
     sent_keys: tuple[str, ...]
     record_sent: Callable[[str], Awaitable[None]]
     notice: str = NOTICE
+    failure: str = ''
+    error: Exception | None = None
 
 
 class AlertRedelivery:
@@ -86,7 +93,10 @@ class AlertRedelivery:
             return 'Некорректная кнопка.'
         if type(payload.get('message_id')) is not int or payload['message_id'] <= 0:
             return 'Некорректная кнопка.'
+        retry_id = uuid4().hex[:12]
+        log_retry(logger, 'alert_retry_clicked', retry_id=retry_id, alert_id=payload['message_id'])
         if token in self.active or len(self.active) >= 2:
+            log_retry(logger, 'alert_retry_rejected', retry_id=retry_id, alert_id=payload['message_id'], reason='Retry busy')
             return 'Отправка уже выполняется. Дождись завершения.'
         self.active.add(token)
         claim = None
@@ -100,21 +110,30 @@ class AlertRedelivery:
                 claim = await acquisition
                 raise
             if claim is None:
+                log_retry(logger, 'alert_retry_rejected', retry_id=retry_id, alert_id=payload['message_id'],
+                          reason='Expired, claimed or mismatched alert')
                 return 'Алерт истёк, недоступен или уже обрабатывается.'
-            task = asyncio.create_task(self._run(token, claim))
+            task = asyncio.create_task(self._run(token, claim, retry_id))
             self.tasks.add(task)
             task.add_done_callback(self._done)
             handed_off = True
             claim = None  # The task owns the database session from here.
             return 'Ставлю повторную загрузку в очередь.'
+        except Exception as error:
+            log_retry(logger, 'alert_retry_failed', retry_id=retry_id, alert_id=payload['message_id'],
+                      reason='Retry claim failed', error=error)
+            return 'Не удалось начать повторную отправку. Попробуй позже.'
         finally:
             if claim is not None:
                 await asyncio.to_thread(claim.close)
             if not handed_off:
                 self.active.discard(token)
 
-    async def _run(self, token, claim):
+    async def _run(self, token, claim, retry_id):
         request = claim.request
+        context = None
+        log_retry(logger, 'alert_retry_started', retry_id=retry_id, alert_id=request['message_id'],
+                  url=request['url'], mode=request['lorebook_mode'], sent_count=len(request['sent_keys']))
         try:
             if not request['delivered']:
                 await self._markup(request, keyboard(token, busy=True))
@@ -129,6 +148,8 @@ class AlertRedelivery:
                     except asyncio.CancelledError:
                         await write
                         raise
+                    log_retry(logger, 'alert_retry_file_sent', retry_id=retry_id,
+                              alert_id=request['message_id'], url=request['url'], file_key=key)
 
                 context = Redelivery(request['lorebook_mode'], tuple(request['sent_keys']), record_sent)
                 complete = await self.download(message, context)
@@ -140,18 +161,28 @@ class AlertRedelivery:
                         await write
                         raise
             if request['delivered']:
+                log_retry(logger, 'alert_retry_succeeded', retry_id=retry_id, alert_id=request['message_id'],
+                          url=request['url'], sent_count=len(request['sent_keys']))
                 try:
                     await self.alert_bot.delete_message(self.admin_id, request['message_id'])
                 except Exception:
+                    log_retry(logger, 'alert_retry_delete_failed', retry_id=retry_id, alert_id=request['message_id'],
+                              url=request['url'], reason='Files delivered; alert deletion failed')
                     await self._markup(request, keyboard(token))
                     await self._notice(request, token, 'Карточка отправлена. Повторное нажатие повторит только удаление алерта.')
             else:
+                log_retry(logger, 'alert_retry_failed', retry_id=retry_id, alert_id=request['message_id'],
+                          url=request['url'], sent_count=len(request['sent_keys']),
+                          reason=context.failure if context and context.failure else 'Not all files delivered',
+                          error=context.error if context else None)
                 await self._markup(request, keyboard(token))
                 await self._notice(request, token, 'Не удалось отправить все файлы. Алерт сохранён, можно повторить попытку.')
         except asyncio.CancelledError:
+            log_retry(logger, 'alert_retry_cancelled', retry_id=retry_id, alert_id=request['message_id'], url=request['url'])
             raise
         except Exception as error:
-            logging.warning('Card alert redelivery failed: %s', type(error).__name__)
+            log_retry(logger, 'alert_retry_failed', retry_id=retry_id, alert_id=request['message_id'],
+                      url=request['url'], error=error, reason='Unexpected retry failure')
             await self._markup(request, keyboard(token))
             await self._notice(request, token, 'Повторная отправка не удалась. Алерт сохранён.')
         finally:
