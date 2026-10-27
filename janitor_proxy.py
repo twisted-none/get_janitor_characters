@@ -93,6 +93,10 @@ def _api_json(page: Any, token: str, path: str, method: str = "GET", body: Any =
         "requestId": str(uuid4()) if path == "/generateAlpha" else "",
     })
     trace.emit('response', operation='janitor_api', http_status=result['status'], bytes=len(result['text']))
+    if result['status'] == 401:
+        raise SourceError('auth_required', http_status=401)
+    if result['status'] == 403:
+        raise SourceError('access_denied', http_status=403)
     if not 200 <= result["status"] < 300:
         raise SourceError("http_error", http_status=result["status"])
     if len(result["text"]) > 8_000_000:
@@ -119,7 +123,7 @@ def parse_definition(system_content: str, character_name: str) -> dict[str, str]
         if match:
             result[field] = match.group(1).strip()
     if not result.get("personality"):
-        raise ValueError("Janitor не вернул скрытую персоналию")
+        raise SourceError('definition_missing', 'Janitor не вернул определение персонажа.')
     return result
 
 
@@ -130,7 +134,7 @@ def extract_definition(page: Any, context: Any, character_id: str) -> dict[str, 
         raise SourceError("auth_required", "Для скрытого определения нужна авторизованная сессия Janitor")
     character = _api_json(page, token, f"/mb/characters/{character_id}")
     require_public(character)
-    if not character.get("allow_proxy"):
+    if character.get("allow_proxy") is not True:
         raise SourceError("proxy_disabled", "Автор персонажа отключил внешний прокси")
     chat = _api_json(page, token, "/mb/chats", "POST", {"character_id": character_id})
     chat_id, user_id = chat.get("id"), chat.get("user_id")
@@ -176,11 +180,11 @@ def extract_definition(page: Any, context: Any, character_id: str) -> dict[str, 
     response = _api_json(page, token, "/generateAlpha", "POST", body)
     response_messages = response.get("messages")
     if not isinstance(response_messages, list):
-        raise ValueError("Janitor не вернул сообщения модели")
+        raise SourceError('definition_missing', 'Janitor не вернул сообщения модели.')
     system = next((message.get("content", "") for message in response_messages
                    if isinstance(message, dict) and message.get("role") == "system"), "")
     if not isinstance(system, str):
-        raise ValueError("Janitor не вернул системный текст")
+        raise SourceError('invalid_response', 'Janitor вернул неподдерживаемый формат системного текста.')
     definition = parse_definition(system, str(character.get("chat_name") or character.get("name") or ""))
     if first and isinstance(first.get("message"), str):
         definition["first_message"] = first["message"]

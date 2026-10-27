@@ -1198,6 +1198,45 @@ def _download_datacat_character_sync(character_id: str) -> str:
     logging.info("DataCat PNG с metadata сохранен: %s", file_path)
     return file_path
 
+def _load_janitor_card(page, page_url, payloads):
+    payloads.clear()
+    response = _navigate(page, page_url, wait_until='domcontentloaded', timeout=45_000)
+    require_origin(page)
+    if response is not None:
+        if response.status == 401:
+            raise SourceError('auth_required', http_status=401)
+        if response.status == 403:
+            raise SourceError('access_denied', http_status=403)
+        if response.status == 404:
+            raise SourceError('not_found', http_status=404)
+        if response.status >= 400:
+            raise SourceError('http_error', http_status=response.status)
+    if urlparse(page.url).path.rstrip('/') in ('/login', '/signin'):
+        raise SourceError('auth_required')
+    try:
+        page.wait_for_load_state('networkidle', timeout=15_000)
+    except Exception:
+        logging.info('Janitor networkidle timeout, проверяем уже полученные данные')
+    require_origin(page)
+    state = page.evaluate(JANITOR_STATE_SCRIPT)
+    character = _extract_janitor_character(state, payloads)
+    require_public(character)
+    return state, character
+
+
+@trace.traced('session_check')
+def _ensure_janitor_session(page, context):
+    """Return whether login was needed; never navigate to login for a live session."""
+    require_origin(page)
+    if get_access_token(page, context):
+        return False
+    _login_janitor(page)
+    require_origin(page)
+    if not get_access_token(page, context):
+        raise SourceError('auth_required', 'Для определения через proxy нужна действующая сессия Janitor AI.')
+    return True
+
+
 def _download_janitor_character_sync(character_id: str) -> str:
     logging.info("Старт скачивания Janitor character_id=%s", character_id)
     load_data()
@@ -1215,35 +1254,31 @@ def _download_janitor_character_sync(character_id: str) -> str:
             context.add_cookies(_browser_cookies())
 
         page = context.new_page()
-        _login_janitor(page)
-        _sync_context_cookies(context)
-
         page.on("response", lambda response: _capture_json_response(response, payloads, ("janitorai.com",)))
         logging.info("Открываем Janitor страницу через Chromium: %s", page_url)
-        response = _navigate(page, page_url, wait_until="domcontentloaded", timeout=45_000)
-        require_origin(page)
-        if response and response.status in (401, 403):
-            raise SourceError("access_denied", "Janitor AI отклонил доступ: проверь авторизацию или Cloudflare/WAF.", http_status=response.status)
         try:
-            page.wait_for_load_state("networkidle", timeout=15_000)
-        except Exception:
-            logging.info("Janitor networkidle timeout, продолжаем с уже полученными данными")
-
-        user_agent = page.evaluate("navigator.userAgent")
-        state = page.evaluate(JANITOR_STATE_SCRIPT)
-        raw_character = _extract_janitor_character(state, payloads)
-        require_public(raw_character)
+            state, raw_character = _load_janitor_card(page, page_url, payloads)
+        except SourceError as error:
+            if error.code != 'auth_required':
+                raise
+            _ensure_janitor_session(page, context)
+            state, raw_character = _load_janitor_card(page, page_url, payloads)
+        if not _definition_text(raw_character):
+            if _ensure_janitor_session(page, context):
+                state, raw_character = _load_janitor_card(page, page_url, payloads)
         if not _definition_text(raw_character):
             try:
                 recovered = extract_definition(page, context, character_id.split("_", 1)[0])
                 raw_character.update(recovered)
                 raw_character["definition_source"] = "janitor_proxy_prompt"
-            except ValueError as exc:
-                logging.info("Скрытое определение Janitor недоступно: %s", exc)
             except Exception as exc:
-                logging.warning("Не удалось запросить скрытое определение Janitor: %s", type(exc).__name__)
+                diagnostic = describe_error(exc)
+                logging.warning('janitor_definition_failed code=%s http_status=%s error_type=%s',
+                                diagnostic.code, diagnostic.http_status, diagnostic.error_type)
+        _sync_context_cookies(context)
         if get_access_token(page, context):
             _save_janitor_state(context)
+        user_agent = page.evaluate("navigator.userAgent")
         card = _to_chara_card_v2(raw_character)
         image_url = _find_janitor_image(raw_character, state, payloads, character_id)
         if not image_url:

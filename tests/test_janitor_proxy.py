@@ -3,6 +3,7 @@ import json
 import time
 import unittest
 from unittest.mock import Mock
+from download_errors import SourceError
 
 import janitor_proxy
 
@@ -13,6 +14,37 @@ def _token(expires_in: int = 3600) -> str:
 
 
 class JanitorProxyTests(unittest.TestCase):
+    def test_api_distinguishes_missing_auth_from_access_denied(self):
+        for status, code in ((401, 'auth_required'), (403, 'access_denied')):
+            page = Mock(url='https://janitorai.com')
+            page.evaluate.return_value = {'status': status, 'text': 'fixture-secret'}
+            with self.assertRaises(SourceError) as caught:
+                janitor_proxy._api_json(page, 'fake-token', '/mb/characters/fixture')
+            self.assertEqual((caught.exception.code, caught.exception.http_status), (code, status))
+            self.assertNotIn('fixture-secret', str(caught.exception))
+
+    def test_missing_definition_is_not_a_successful_proxy_result(self):
+        with self.assertRaises(SourceError) as caught:
+            janitor_proxy.parse_definition('<Scenario>Only a scene</Scenario>', 'Ada')
+        self.assertEqual(caught.exception.code, 'definition_missing')
+
+    def test_proxy_permission_requires_an_explicit_boolean_true(self):
+        for permission in (False, None, 'false', 'true', 1):
+            page = Mock(url='https://janitorai.com')
+            calls = []
+
+            def evaluate(script, args=None):
+                if args is None:
+                    return _token()
+                calls.append(args['path'])
+                return {'status': 200, 'text': json.dumps({'is_public': True, 'allow_proxy': permission})}
+
+            page.evaluate.side_effect = evaluate
+            with self.assertRaises(SourceError) as caught:
+                janitor_proxy.extract_definition(page, Mock(), 'fixture')
+            self.assertEqual(caught.exception.code, 'proxy_disabled')
+            self.assertEqual(calls, ['/mb/characters/fixture'])
+
     def test_created_response_is_accepted(self) -> None:
         page = Mock(url="https://janitorai.com")
         page.evaluate.return_value = {"status": 201, "text": '{"id":12}'}

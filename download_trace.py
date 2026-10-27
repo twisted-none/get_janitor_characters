@@ -26,7 +26,7 @@ _VALUES = {
     'operation': {'http', 'identify', 'datacat_api', 'datacat_identify', 'datacat_lookup', 'datacat',
                   'jannyai', 'proxy', 'llm', 'browser_launch', 'navigate', 'login', 'login_email',
                   'login_password', 'login_submit', 'parse_card', 'write_png', 'download_image',
-                  'janitor_api', 'proxy_definition', 'export', 'telegram_send', 'lorebooks'},
+                  'janitor_api', 'proxy_definition', 'session_check', 'export', 'telegram_send', 'lorebooks'},
     'source': {'datacat', 'jannyai', 'proxy', 'llm', ''},
     'method': {'GET', 'POST', 'OPTIONS', 'HEAD', 'DELETE', 'PUT', 'PATCH'},
     'reason': {'definition_missing', 'all_sources_exhausted', 'source_kind_janitor', 'default'},

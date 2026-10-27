@@ -6,7 +6,7 @@ import ssl
 
 
 ERROR_CODES = frozenset({
-    "creator_redirect_required",
+    "creator_redirect_required", "definition_missing",
     "not_found", "http_error", "auth_required", "access_denied", "login_failed", "challenge_required",
     "browser_launch_failed", "browser_missing", "browser_sandbox_failed", "browser_request_failed",
     "dns_error", "tls_error", "network_error", "timeout", "permission_denied", "file_missing",
