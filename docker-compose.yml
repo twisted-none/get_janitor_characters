@@ -15,6 +15,7 @@ services:
       - METRICS_PORT=${METRICS_PORT:-8000}
     ports:
       - "${METRICS_HOST_PORT:-18001}:${METRICS_PORT:-8000}"
+      - "127.0.0.1:18002:8001"
     restart: unless-stopped
     init: true
     read_only: true
